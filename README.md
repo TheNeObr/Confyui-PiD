@@ -29,7 +29,12 @@ Custom node para usar o `nvidia/PiD` no ComfyUI no fluxo proprio do PiD, sem dep
   - Saida: `IMAGE`.
 
 - `PiD Decode Latent Tiled`
-  - Entradas: `PID_MODEL`, `LATENT`, `tile_size`, `tile_overlap`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
+  - Entradas: `PID_MODEL`, `LATENT`, `tile_size`, `tile_overlap`, `tile_batch_size`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
+  - Entrada opcional: `PID_PROMPT`.
+  - Saida: `IMAGE`.
+
+- `PiD KSampler`
+  - Entradas: `PID_MODEL`, `LATENT`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`, `use_tiled`, `tile_size`, `tile_overlap`, `tile_batch_size`.
   - Entrada opcional: `PID_PROMPT`.
   - Saida: `IMAGE`.
 
@@ -38,7 +43,7 @@ Custom node para usar o `nvidia/PiD` no ComfyUI no fluxo proprio do PiD, sem dep
 1. Carregue o modelo com `PiD Load Model`.
 2. Se for reutilizar o mesmo prompt, use `PiD Encode Prompt`.
 3. Use um `LATENT` compativel com o backbone, ou gere um com `PiD Encode Image`.
-4. Faça o decode com `PiD Decode Latent` ou `PiD Decode Latent Tiled`.
+4. Faça o decode com `PiD Decode Latent`, `PiD Decode Latent Tiled` ou `PiD KSampler`.
 
 ## Instalacao
 
@@ -64,6 +69,7 @@ pip install -r requirements.txt
 - O runtime do PiD tambem carrega o text encoder `Efficient-Large-Model/gemma-2-2b-it`, entao o primeiro uso exige bastante VRAM, RAM e disco.
 - O node usa CUDA. Nao ha suporte pratico a CPU neste wrapper.
 - Este pacote nao mantem nodes de `conditioner`, `KSampler` ou nodes experimentais fora do fluxo principal do PiD.
+- O `PiD Decode Latent Tiled` e o `PiD KSampler` usam `tile_batch_size` para processar varios tiles iguais por chamada e reduzir overhead.
 - O modelo `nvidia/PiD` tem termos de uso proprios da NVIDIA. Confira a licenca no card do modelo antes de distribuir ou usar em producao.
 
 ## Validacao local

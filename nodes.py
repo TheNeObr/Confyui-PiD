@@ -8,6 +8,7 @@ from .pid_runtime import (
     encode_image_to_latent,
     encode_prompt,
     load_pid_model,
+    pid_ksampler,
 )
 
 
@@ -118,6 +119,67 @@ class PiDEncodePrompt:
         return (encode_prompt(pid_model, prompt),)
 
 
+class PiDKSampler:
+    CATEGORY = "PiD"
+    FUNCTION = "sample"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pid_model": ("PID_MODEL",),
+                "latent": ("LATENT",),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "pid_inference_steps": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "degrade_sigma": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "use_tiled": ("BOOLEAN", {"default": False}),
+                "tile_size": ("INT", {"default": 256, "min": 64, "max": 2048, "step": 64}),
+                "tile_overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8}),
+                "tile_batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
+            },
+            "optional": {
+                "pid_prompt": ("PID_PROMPT",),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    def sample(
+        self,
+        pid_model,
+        latent,
+        prompt: str,
+        pid_inference_steps: int,
+        seed: int,
+        degrade_sigma: float,
+        use_tiled: bool,
+        tile_size: int,
+        tile_overlap: int,
+        tile_batch_size: int,
+        pid_prompt=None,
+        unique_id=None,
+    ):
+        image = pid_ksampler(
+            handle=pid_model,
+            latent=latent,
+            prompt=prompt,
+            pid_inference_steps=pid_inference_steps,
+            seed=seed,
+            degrade_sigma=degrade_sigma,
+            use_tiled=use_tiled,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
+            pid_prompt=pid_prompt,
+            unique_id=unique_id,
+        )
+        return (image,)
+
+
 class PiDDecodeLatentTiled:
     CATEGORY = "PiD"
     FUNCTION = "decode"
@@ -132,6 +194,7 @@ class PiDDecodeLatentTiled:
                 "latent": ("LATENT",),
                 "tile_size": ("INT", {"default": 256, "min": 64, "max": 2048, "step": 64}),
                 "tile_overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8}),
+                "tile_batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
                 "pid_inference_steps": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
@@ -151,6 +214,7 @@ class PiDDecodeLatentTiled:
         latent,
         tile_size: int,
         tile_overlap: int,
+        tile_batch_size: int,
         prompt: str,
         pid_inference_steps: int,
         seed: int,
@@ -163,6 +227,7 @@ class PiDDecodeLatentTiled:
             latent=latent,
             tile_size=tile_size,
             tile_overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
             prompt=prompt,
             cfg_scale=1.0,
             pid_inference_steps=pid_inference_steps,
@@ -178,6 +243,7 @@ NODE_CLASS_MAPPINGS = {
     "PiDDecodeLatentTiled": PiDDecodeLatentTiled,
     "PiDEncodeImage": PiDEncodeImage,
     "PiDEncodePrompt": PiDEncodePrompt,
+    "PiDKSampler": PiDKSampler,
     "PiDLoadModel": PiDLoadModel,
     "PiDDecodeLatent": PiDDecodeLatent,
 }
@@ -186,6 +252,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PiDDecodeLatentTiled": "PiD Decode Latent Tiled",
     "PiDEncodeImage": "PiD Encode Image",
     "PiDEncodePrompt": "PiD Encode Prompt",
+    "PiDKSampler": "PiD KSampler",
     "PiDLoadModel": "PiD Load Model",
     "PiDDecodeLatent": "PiD Decode Latent",
 }

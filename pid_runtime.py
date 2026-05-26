@@ -76,6 +76,16 @@ class _DecodeProgress:
             self._bar.update_absolute(self.current, self.total, preview)
 
 
+@dataclass(frozen=True)
+class _TileDecodeJob:
+    start_y: int
+    start_x: int
+    end_y: int
+    end_x: int
+    out_y: int
+    out_x: int
+
+
 def _ensure_upstream_path() -> None:
     upstream_str = str(UPSTREAM_ROOT)
     if upstream_str not in sys.path:
@@ -428,6 +438,70 @@ def resize_latent(latent: Any, latent_scale: float, interpolation: str) -> Any:
     return resized_latent
 
 
+def _repeat_pid_prompt(pid_prompt: PiDPrompt, repeat_blocks: int, base_batch: int) -> PiDPrompt:
+    if repeat_blocks <= 1:
+        return pid_prompt
+
+    caption_embs = pid_prompt.caption_embs
+    attention_mask = pid_prompt.attention_mask
+    prompt_batch = int(caption_embs.shape[0])
+    target_batch = base_batch * repeat_blocks
+
+    if prompt_batch == 1:
+        caption_embs = caption_embs.expand(target_batch, -1, -1).contiguous()
+        if attention_mask is not None:
+            attention_mask = attention_mask.expand(target_batch, -1).contiguous()
+    elif prompt_batch == base_batch:
+        caption_embs = caption_embs.repeat((repeat_blocks, 1, 1)).contiguous()
+        if attention_mask is not None:
+            attention_mask = attention_mask.repeat((repeat_blocks, 1)).contiguous()
+    elif prompt_batch != target_batch:
+        raise ValueError(
+            f"caption_embs precisa ter batch 1, {base_batch} ou {target_batch}, mas recebeu {prompt_batch}."
+        )
+
+    return PiDPrompt(caption_embs=caption_embs, attention_mask=attention_mask, prompt=pid_prompt.prompt)
+
+
+def _make_decode_noise(
+    batch_size: int,
+    output_h: int,
+    output_w: int,
+    device: str,
+    seed: int,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    gen = torch.Generator(device=device).manual_seed(int(seed))
+    return torch.randn((batch_size, 3, output_h, output_w), device=device, dtype=dtype, generator=gen)
+
+
+def _iter_tile_jobs(
+    latent_tensor: torch.Tensor,
+    compression: int,
+    pid_scale: int,
+    tile_latent: int,
+    overlap_latent: int,
+) -> list[_TileDecodeJob]:
+    starts_y = _compute_tile_starts(int(latent_tensor.shape[-2]), tile_latent, overlap_latent)
+    starts_x = _compute_tile_starts(int(latent_tensor.shape[-1]), tile_latent, overlap_latent)
+    jobs: list[_TileDecodeJob] = []
+    for start_y in starts_y:
+        for start_x in starts_x:
+            end_y = min(start_y + tile_latent, int(latent_tensor.shape[-2]))
+            end_x = min(start_x + tile_latent, int(latent_tensor.shape[-1]))
+            jobs.append(
+                _TileDecodeJob(
+                    start_y=start_y,
+                    start_x=start_x,
+                    end_y=end_y,
+                    end_x=end_x,
+                    out_y=start_y * compression * pid_scale,
+                    out_x=start_x * compression * pid_scale,
+                )
+            )
+    return jobs
+
+
 def _decode_samples(
     handle: PiDHandle,
     latent_tensor: torch.Tensor,
@@ -438,6 +512,8 @@ def _decode_samples(
     degrade_sigma: float,
     progress: _DecodeProgress | None = None,
     preview_enabled: bool = False,
+    noise: torch.Tensor | None = None,
+    progress_advance: int = 1,
 ) -> torch.Tensor:
     if latent_tensor.shape[1] != handle.latent_channels:
         raise ValueError(
@@ -469,7 +545,13 @@ def _decode_samples(
     sigma_tensor = torch.full((batch_size,), float(degrade_sigma), device=device, dtype=torch.float32)
 
     gen = torch.Generator(device=device).manual_seed(int(seed))
-    noise = torch.randn((batch_size, 3, output_h, output_w), device=device, generator=gen)
+    if noise is None:
+        noise = torch.randn((batch_size, 3, output_h, output_w), device=device, dtype=precision, generator=gen)
+    else:
+        expected_shape = (batch_size, 3, output_h, output_w)
+        if tuple(noise.shape) != expected_shape:
+            raise ValueError(f"Ruido inicial invalido para PiD: esperado {expected_shape}, recebido {tuple(noise.shape)}.")
+        noise = noise.to(device=device, dtype=precision)
     autocast_ctx = torch.autocast("cuda", dtype=model.autocast_dtype) if getattr(model, "autocast_dtype", None) else nullcontext()
     net = model.net
     net.eval()
@@ -509,7 +591,7 @@ def _decode_samples(
                 )
                 x0_student = model._velocity_to_x0(noise, v_student, t_student)
             if progress is not None:
-                progress.update(preview=_preview_tuple_from_x0(x0_student))
+                progress.update(advance=progress_advance, preview=_preview_tuple_from_x0(x0_student))
         else:
             t_list = model._get_t_list(device=torch.device(device), num_steps=effective_steps)
             x = noise
@@ -551,7 +633,7 @@ def _decode_samples(
                         preview_x0 = x
 
                     if progress is not None:
-                        progress.update(preview=_preview_tuple_from_x0(preview_x0))
+                        progress.update(advance=progress_advance, preview=_preview_tuple_from_x0(preview_x0))
             x0_student = x
     return x0_student.clamp(-1, 1).unsqueeze(2)
 
@@ -646,6 +728,7 @@ def decode_latent_tiled(
     degrade_sigma: float,
     tile_size: int,
     tile_overlap: int,
+    tile_batch_size: int = 1,
     pid_prompt: Any = None,
     unique_id: str | None = None,
 ) -> torch.Tensor:
@@ -661,11 +744,12 @@ def decode_latent_tiled(
         raise ValueError(f"tile_size precisa ser multiplo de {compression} para o backbone '{handle.backbone}'.")
     if tile_overlap % compression != 0:
         raise ValueError(f"tile_overlap precisa ser multiplo de {compression} para o backbone '{handle.backbone}'.")
+    if tile_batch_size <= 0:
+        raise ValueError("tile_batch_size precisa ser maior que zero.")
 
     tile_latent = tile_size // compression
     overlap_latent = tile_overlap // compression
-    starts_y = _compute_tile_starts(int(latent_tensor.shape[-2]), tile_latent, overlap_latent)
-    starts_x = _compute_tile_starts(int(latent_tensor.shape[-1]), tile_latent, overlap_latent)
+    tile_jobs = _iter_tile_jobs(latent_tensor, compression, handle.pid_scale, tile_latent, overlap_latent)
 
     baseline_h = int(latent_tensor.shape[-2]) * compression
     baseline_w = int(latent_tensor.shape[-1]) * compression
@@ -678,58 +762,135 @@ def decode_latent_tiled(
     weight_sum = torch.zeros((batch_size, output_h, output_w, 1), dtype=torch.float32)
 
     prompt_value = _normalize_pid_prompt(pid_prompt) if pid_prompt is not None else _encode_prompt_once(handle, prompt)
-    tile_count = len(starts_y) * len(starts_x)
+    tile_count = len(tile_jobs)
     effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else 4
     progress = _DecodeProgress(total=max(1, tile_count * max(1, effective_steps)), node_id=unique_id)
+    model = _get_model(handle)
+    precision = getattr(model, "precision", torch.float32)
+    full_noise = _make_decode_noise(batch_size, output_h, output_w, handle.device, seed, dtype=precision)
 
-    for start_y in starts_y:
-        for start_x in starts_x:
-            end_y = min(start_y + tile_latent, int(latent_tensor.shape[-2]))
-            end_x = min(start_x + tile_latent, int(latent_tensor.shape[-1]))
-            tile_latent_tensor = latent_tensor[:, :, start_y:end_y, start_x:end_x].contiguous()
-            tile_samples = _decode_samples(
-                handle=handle,
-                latent_tensor=tile_latent_tensor,
-                pid_prompt=prompt_value,
-                cfg_scale=cfg_scale,
-                pid_inference_steps=pid_inference_steps,
-                seed=seed,
-                degrade_sigma=degrade_sigma,
-                progress=progress,
-                preview_enabled=False,
-            )
-            tile_image = _samples_to_comfy_image(tile_samples)
+    index = 0
+    while index < tile_count:
+        first_job = tile_jobs[index]
+        first_h = first_job.end_y - first_job.start_y
+        first_w = first_job.end_x - first_job.start_x
+        job_batch = [first_job]
+        index += 1
 
-            out_y = start_y * compression * handle.pid_scale
-            out_x = start_x * compression * handle.pid_scale
+        while index < tile_count and len(job_batch) < tile_batch_size:
+            candidate = tile_jobs[index]
+            if (candidate.end_y - candidate.start_y, candidate.end_x - candidate.start_x) != (first_h, first_w):
+                break
+            job_batch.append(candidate)
+            index += 1
+
+        latent_batch = torch.cat(
+            [
+                latent_tensor[:, :, job.start_y : job.end_y, job.start_x : job.end_x].contiguous()
+                for job in job_batch
+            ],
+            dim=0,
+        )
+        noise_batch = torch.cat(
+            [
+                full_noise[
+                    :,
+                    :,
+                    job.out_y : job.out_y + (job.end_y - job.start_y) * compression * handle.pid_scale,
+                    job.out_x : job.out_x + (job.end_x - job.start_x) * compression * handle.pid_scale,
+                ].contiguous()
+                for job in job_batch
+            ],
+            dim=0,
+        )
+        tile_samples = _decode_samples(
+            handle=handle,
+            latent_tensor=latent_batch,
+            pid_prompt=_repeat_pid_prompt(prompt_value, len(job_batch), batch_size),
+            cfg_scale=cfg_scale,
+            pid_inference_steps=pid_inference_steps,
+            seed=seed,
+            degrade_sigma=degrade_sigma,
+            progress=progress,
+            preview_enabled=False,
+            noise=noise_batch,
+            progress_advance=len(job_batch),
+        )
+        tile_images = _samples_to_comfy_image(tile_samples)
+
+        for offset, job in enumerate(job_batch):
+            tile_image = tile_images[offset * batch_size : (offset + 1) * batch_size]
             tile_h = int(tile_image.shape[1])
             tile_w = int(tile_image.shape[2])
             weight = _tile_weight_mask(
                 height=tile_h,
                 width=tile_w,
                 overlap=min(overlap_out, tile_h // 2, tile_w // 2),
-                top_edge=start_y == 0,
-                bottom_edge=end_y == int(latent_tensor.shape[-2]),
-                left_edge=start_x == 0,
-                right_edge=end_x == int(latent_tensor.shape[-1]),
+                top_edge=job.start_y == 0,
+                bottom_edge=job.end_y == int(latent_tensor.shape[-2]),
+                left_edge=job.start_x == 0,
+                right_edge=job.end_x == int(latent_tensor.shape[-1]),
                 device=tile_image.device,
             )
+            output[:, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w, :] += tile_image * weight
+            weight_sum[:, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w, :] += weight
 
-            output[:, out_y : out_y + tile_h, out_x : out_x + tile_w, :] += tile_image * weight
-            weight_sum[:, out_y : out_y + tile_h, out_x : out_x + tile_w, :] += weight
-            composed = output / weight_sum.clamp_min(1e-6)
+        composed = output / weight_sum.clamp_min(1e-6)
+        preview = None
+        try:
+            arr = (composed[0].clamp(0, 1).cpu().numpy() * 255.0).astype("uint8")
+            preview_image = Image.fromarray(arr)
+            from comfy.cli_args import args
+
+            preview_size = int(getattr(args, "preview_size", 512))
+            if preview_size > 0:
+                preview_image.thumbnail((preview_size, preview_size))
+            preview = ("JPEG", preview_image, preview_size)
+        except Exception:
             preview = None
-            try:
-                arr = (composed[0].clamp(0, 1).cpu().numpy() * 255.0).astype("uint8")
-                preview_image = Image.fromarray(arr)
-                from comfy.cli_args import args
-
-                preview_size = int(getattr(args, "preview_size", 512))
-                if preview_size > 0:
-                    preview_image.thumbnail((preview_size, preview_size))
-                preview = ("JPEG", preview_image, preview_size)
-            except Exception:
-                preview = None
-            progress.update(advance=0, preview=preview)
+        progress.update(advance=0, preview=preview)
 
     return output / weight_sum.clamp_min(1e-6)
+
+
+def pid_ksampler(
+    handle: PiDHandle,
+    latent: Any,
+    prompt: str,
+    pid_inference_steps: int,
+    seed: int,
+    degrade_sigma: float,
+    use_tiled: bool = False,
+    tile_size: int = 256,
+    tile_overlap: int = 64,
+    tile_batch_size: int = 1,
+    pid_prompt: Any = None,
+    unique_id: str | None = None,
+) -> torch.Tensor:
+    if use_tiled:
+        return decode_latent_tiled(
+            handle=handle,
+            latent=latent,
+            prompt=prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=pid_inference_steps,
+            seed=seed,
+            degrade_sigma=degrade_sigma,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
+            pid_prompt=pid_prompt,
+            unique_id=unique_id,
+        )
+
+    return decode_latent(
+        handle=handle,
+        latent=latent,
+        prompt=prompt,
+        cfg_scale=1.0,
+        pid_inference_steps=pid_inference_steps,
+        seed=seed,
+        degrade_sigma=degrade_sigma,
+        pid_prompt=pid_prompt,
+        unique_id=unique_id,
+    )

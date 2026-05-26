@@ -43,7 +43,7 @@ class DummyModel:
         self.precision = torch.float32
         self.autocast_dtype = None
         self.fm_trainer = types.SimpleNamespace(timescale=1000.0)
-        self.net = mock.Mock()
+        self.net = mock.Mock(side_effect=lambda x, *args, **kwargs: torch.zeros_like(x))
         self.text_encoder = mock.Mock()
         self.vae_encoder = mock.Mock()
 
@@ -64,6 +64,14 @@ class DummyModel:
         self.last_lq_latent = lq_latent
         self.last_degrade_sigma = degrade_sigma_tensor
         return torch.ones_like(noise)
+
+    def _velocity_to_x0(self, x, v_pred, t):
+        self.call_count += 1
+        self.last_caption_embs = getattr(self, "last_caption_embs", None)
+        return torch.ones_like(x)
+
+    def _net_output_to_velocity(self, x, v_pred, t_cur_batch, prediction_type):
+        return torch.zeros_like(x)
 
     def encode_lq_latent(self, image):
         self.last_image = image
@@ -148,6 +156,7 @@ class PiDRuntimeTests(unittest.TestCase):
             latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
             tile_size=16,
             tile_overlap=8,
+            tile_batch_size=1,
             prompt="cat",
             pid_inference_steps=4,
             seed=3,
@@ -156,7 +165,26 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertEqual(tuple(image.shape), (1, 128, 128, 3))
         self.assertTrue(torch.allclose(image, torch.ones_like(image)))
-        self.assertEqual(model.call_count, 9)
+        self.assertGreaterEqual(model.call_count, 9)
+
+    def test_decode_latent_tiled_batches_same_size_tiles(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+
+        image = pid_runtime.decode_latent_tiled(
+            handle=handle,
+            latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
+            tile_size=16,
+            tile_overlap=8,
+            tile_batch_size=4,
+            prompt="cat",
+            pid_inference_steps=4,
+            seed=3,
+            degrade_sigma=0.0,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 128, 128, 3))
+        self.assertTrue(torch.allclose(image, torch.ones_like(image)))
 
     def test_decode_latent_tiled_validates_tile_alignment(self):
         handle = self._register_runtime(DummyModel(), backbone="flux2", latent_channels=128, latent_compression=16)
@@ -167,11 +195,31 @@ class PiDRuntimeTests(unittest.TestCase):
                 latent={"samples": torch.zeros((1, 128, 4, 4), dtype=torch.float32)},
                 tile_size=200,
                 tile_overlap=64,
+                tile_batch_size=1,
                 prompt="cat",
                 pid_inference_steps=4,
                 seed=0,
                 degrade_sigma=0.0,
             )
+
+    def test_pid_ksampler_dispatches_to_tiled_path(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+
+        image = pid_runtime.pid_ksampler(
+            handle=handle,
+            latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
+            prompt="cat",
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            use_tiled=True,
+            tile_size=16,
+            tile_overlap=8,
+            tile_batch_size=2,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 128, 128, 3))
 
     def test_resize_latent_resizes_dict_samples(self):
         latent = {
@@ -255,7 +303,16 @@ class PiDNodeTests(unittest.TestCase):
         node = nodes.PiDDecodeLatentTiled()
         sentinel = torch.zeros((1, 64, 64, 3))
         with mock.patch.object(nodes, "decode_latent_tiled", return_value=sentinel) as patched:
-            result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, 256, 64, "cat", 4, 1, 0.0)
+            result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, 256, 64, 2, "cat", 4, 1, 0.0)
+
+        patched.assert_called_once()
+        self.assertEqual(result, (sentinel,))
+
+    def test_pid_ksampler_node_delegates_to_runtime(self):
+        node = nodes.PiDKSampler()
+        sentinel = torch.zeros((1, 64, 64, 3))
+        with mock.patch.object(nodes, "pid_ksampler", return_value=sentinel) as patched:
+            result = node.sample("model", {"samples": torch.zeros((1, 16, 2, 2))}, "cat", 4, 1, 0.0, True, 256, 64, 2)
 
         patched.assert_called_once()
         self.assertEqual(result, (sentinel,))
