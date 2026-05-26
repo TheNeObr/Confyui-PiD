@@ -1,0 +1,351 @@
+{
+  "last_node_id": 7,
+  "last_link_id": 8,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": {
+        "0": 20,
+        "1": 180
+      },
+      "size": {
+        "0": 320,
+        "1": 314
+      },
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4
+          ],
+          "slot_index": 0,
+          "shape": 3
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "shape": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "input.png",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PiDLoadModel",
+      "pos": {
+        "0": 20,
+        "1": 20
+      },
+      "size": {
+        "0": 260,
+        "1": 90
+      },
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "pid_model",
+          "type": "PID_MODEL",
+          "links": [
+            1,
+            2,
+            3
+          ],
+          "slot_index": 0,
+          "shape": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PiDLoadModel"
+      },
+      "widgets_values": [
+        "flux2",
+        "2kto4k"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "PiDEncodePrompt",
+      "pos": {
+        "0": 380,
+        "1": 20
+      },
+      "size": {
+        "0": 360,
+        "1": 120
+      },
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "pid_model",
+          "type": "PID_MODEL",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "pid_prompt",
+          "type": "PID_PROMPT",
+          "links": [
+            5
+          ],
+          "slot_index": 0,
+          "shape": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PiDEncodePrompt"
+      },
+      "widgets_values": [
+        "ultra detailed skin texture, realistic fabric folds, sharp jewelry details, natural lighting, crisp edges, detailed hair strands, high micro-contrast, realistic materials"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "PiDEncodeImage",
+      "pos": {
+        "0": 380,
+        "1": 210
+      },
+      "size": {
+        "0": 260,
+        "1": 90
+      },
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "pid_model",
+          "type": "PID_MODEL",
+          "link": 2
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            6
+          ],
+          "slot_index": 0,
+          "shape": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PiDEncodeImage"
+      }
+    },
+    {
+      "id": 5,
+      "type": "PiDDecodeLatentTiled",
+      "pos": {
+        "0": 760,
+        "1": 90
+      },
+      "size": {
+        "0": 360,
+        "1": 240
+      },
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "pid_model",
+          "type": "PID_MODEL",
+          "link": 3
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "link": 6
+        },
+        {
+          "name": "pid_prompt",
+          "type": "PID_PROMPT",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            7,
+            8
+          ],
+          "slot_index": 0,
+          "shape": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PiDDecodeLatentTiled"
+      },
+      "widgets_values": [
+        256,
+        64,
+        "",
+        1.0,
+        4,
+        0,
+        0.0
+      ]
+    },
+    {
+      "id": 6,
+      "type": "PreviewImage",
+      "pos": {
+        "0": 1160,
+        "1": 20
+      },
+      "size": {
+        "0": 500,
+        "1": 700
+      },
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 7
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      }
+    },
+    {
+      "id": 7,
+      "type": "SaveImage",
+      "pos": {
+        "0": 1160,
+        "1": 760
+      },
+      "size": {
+        "0": 320,
+        "1": 80
+      },
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 8
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "PiD_4K"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      3,
+      0,
+      "PID_MODEL"
+    ],
+    [
+      2,
+      2,
+      0,
+      4,
+      0,
+      "PID_MODEL"
+    ],
+    [
+      3,
+      2,
+      0,
+      5,
+      0,
+      "PID_MODEL"
+    ],
+    [
+      4,
+      1,
+      0,
+      4,
+      1,
+      "IMAGE"
+    ],
+    [
+      5,
+      3,
+      0,
+      5,
+      2,
+      "PID_PROMPT"
+    ],
+    [
+      6,
+      4,
+      0,
+      5,
+      1,
+      "LATENT"
+    ],
+    [
+      7,
+      5,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      8,
+      5,
+      0,
+      7,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.9,
+      "offset": [
+        50,
+        50
+      ]
+    }
+  },
+  "version": 0.4
+}

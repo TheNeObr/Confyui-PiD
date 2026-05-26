@@ -1,0 +1,265 @@
+import importlib.util
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import torch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_package_module(module_name: str, file_name: str):
+    package_name = "pidnode_custom"
+    if package_name not in sys.modules:
+        package = types.ModuleType(package_name)
+        package.__path__ = [str(ROOT)]
+        sys.modules[package_name] = package
+
+    spec = importlib.util.spec_from_file_location(
+        f"{package_name}.{module_name}",
+        ROOT / file_name,
+        submodule_search_locations=[str(ROOT)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+pid_runtime = _load_package_module("pid_runtime", "pid_runtime.py")
+nodes = _load_package_module("nodes", "nodes.py")
+
+
+class DummyModel:
+    def __init__(self):
+        self.config = types.SimpleNamespace(input_caption_key="caption")
+        self.last_caption_embs = None
+        self.last_lq_latent = None
+        self.last_degrade_sigma = None
+        self.call_count = 0
+        self.precision = torch.float32
+        self.autocast_dtype = None
+        self.fm_trainer = types.SimpleNamespace(timescale=1000.0)
+        self.net = mock.Mock()
+        self.text_encoder = mock.Mock()
+        self.vae_encoder = mock.Mock()
+
+    def eval(self):
+        return self
+
+    def _encode_text_raw(self, captions):
+        batch = len(captions)
+        return torch.full((batch, 4, 8), 2.0, dtype=torch.float32), torch.ones((batch, 4), dtype=torch.int64)
+
+    def _get_t_list(self, device, num_steps=None):
+        steps = num_steps or 4
+        return torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+
+    def _student_sample_loop(self, noise, t_list, caption_embs, lq_video_or_image, lq_latent, degrade_sigma_tensor, generator=None):
+        self.call_count += 1
+        self.last_caption_embs = caption_embs
+        self.last_lq_latent = lq_latent
+        self.last_degrade_sigma = degrade_sigma_tensor
+        return torch.ones_like(noise)
+
+    def encode_lq_latent(self, image):
+        self.last_image = image
+        batch, _, height, width = image.shape
+        return torch.zeros((batch, 16, height // 8, width // 8), dtype=torch.float32, device=image.device)
+
+
+class PiDRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        pid_runtime._ACTIVE_RUNTIME = None
+        pid_runtime._HANDLE_CACHE.clear()
+        pid_runtime._PROMPT_CACHE.clear()
+
+    def _register_runtime(self, model, backbone="flux", ckpt_type="2k", latent_channels=16, latent_compression=8):
+        handle = pid_runtime.PiDHandle(
+            backbone=backbone,
+            ckpt_type=ckpt_type,
+            pid_scale=4,
+            latent_channels=latent_channels,
+            latent_compression=latent_compression,
+            input_caption_key="caption",
+            checkpoint_path="dummy",
+            device="cpu",
+        )
+        pid_runtime._HANDLE_CACHE[(backbone, ckpt_type)] = handle
+        pid_runtime._ACTIVE_RUNTIME = pid_runtime._PiDLoadedRuntime(cache_key=(backbone, ckpt_type), model=model)
+        return handle
+
+    def test_decode_latent_converts_to_comfy_image(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+        latent = {"samples": torch.zeros((1, 16, 2, 3), dtype=torch.float32)}
+
+        image = pid_runtime.decode_latent(
+            handle=handle,
+            latent=latent,
+            prompt="cat",
+            pid_inference_steps=4,
+            seed=7,
+            degrade_sigma=0.25,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 64, 96, 3))
+        self.assertTrue(torch.allclose(image, torch.ones_like(image)))
+        self.assertEqual(tuple(model.last_lq_latent.shape), (1, 16, 2, 3))
+        self.assertEqual(tuple(model.last_caption_embs.shape), (1, 4, 8))
+        self.assertTrue(torch.allclose(model.last_degrade_sigma, torch.tensor([0.25])))
+
+    def test_decode_latent_validates_channel_count(self):
+        handle = self._register_runtime(DummyModel(), backbone="sd3")
+        latent = {"samples": torch.zeros((1, 8, 2, 2), dtype=torch.float32)}
+
+        with self.assertRaises(ValueError):
+            pid_runtime.decode_latent(
+                handle=handle,
+                latent=latent,
+                prompt="cat",
+                pid_inference_steps=4,
+                seed=0,
+                degrade_sigma=0.0,
+            )
+
+    def test_encode_image_to_latent_uses_pid_encoder(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+
+        latent = pid_runtime.encode_image_to_latent(
+            handle=handle,
+            image=torch.ones((1, 64, 96, 3), dtype=torch.float32),
+        )
+
+        self.assertEqual(tuple(latent["samples"].shape), (1, 16, 8, 12))
+        self.assertEqual(tuple(model.last_image.shape), (1, 3, 64, 96))
+        self.assertTrue(torch.allclose(model.last_image, torch.ones_like(model.last_image)))
+
+    def test_decode_latent_tiled_blends_tiles_into_full_image(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+
+        image = pid_runtime.decode_latent_tiled(
+            handle=handle,
+            latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
+            tile_size=16,
+            tile_overlap=8,
+            prompt="cat",
+            pid_inference_steps=4,
+            seed=3,
+            degrade_sigma=0.0,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 128, 128, 3))
+        self.assertTrue(torch.allclose(image, torch.ones_like(image)))
+        self.assertEqual(model.call_count, 9)
+
+    def test_decode_latent_tiled_validates_tile_alignment(self):
+        handle = self._register_runtime(DummyModel(), backbone="flux2", latent_channels=128, latent_compression=16)
+
+        with self.assertRaises(ValueError):
+            pid_runtime.decode_latent_tiled(
+                handle=handle,
+                latent={"samples": torch.zeros((1, 128, 4, 4), dtype=torch.float32)},
+                tile_size=200,
+                tile_overlap=64,
+                prompt="cat",
+                pid_inference_steps=4,
+                seed=0,
+                degrade_sigma=0.0,
+            )
+
+    def test_resize_latent_resizes_dict_samples(self):
+        latent = {
+            "samples": torch.zeros((1, 16, 8, 8), dtype=torch.float32),
+            "noise_mask": torch.ones((1, 8, 8), dtype=torch.float32),
+        }
+
+        resized = pid_runtime.resize_latent(latent, 0.5, "bicubic")
+
+        self.assertEqual(tuple(resized["samples"].shape), (1, 16, 4, 4))
+        self.assertEqual(tuple(resized["noise_mask"].shape), (1, 4, 4))
+
+    def test_encode_prompt_reuses_cached_embeddings(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+
+        first = pid_runtime.encode_prompt(handle, "cat")
+        second = pid_runtime.encode_prompt(handle, "cat")
+
+        self.assertEqual(first["prompt"], "cat")
+        self.assertTrue(torch.equal(first["caption_embs"], second["caption_embs"]))
+        self.assertEqual(model.text_encoder.to.call_count, 2)
+
+    def test_decode_latent_accepts_preencoded_prompt(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+        pid_prompt = {"caption_embs": torch.full((1, 4, 8), 3.0), "attention_mask": torch.ones((1, 4), dtype=torch.int64)}
+
+        image = pid_runtime.decode_latent(
+            handle=handle,
+            latent={"samples": torch.zeros((1, 16, 2, 2), dtype=torch.float32)},
+            prompt="ignored",
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            pid_prompt=pid_prompt,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 64, 64, 3))
+        self.assertTrue(torch.all(model.last_caption_embs == 3.0))
+
+
+class PiDNodeTests(unittest.TestCase):
+    def test_loader_node_delegates_to_runtime(self):
+        node = nodes.PiDLoadModel()
+        sentinel = object()
+        with mock.patch.object(nodes, "load_pid_model", return_value=sentinel) as patched:
+            result = node.load_model("flux", "2k")
+
+        patched.assert_called_once_with("flux", "2k")
+        self.assertEqual(result, (sentinel,))
+
+    def test_decode_node_delegates_to_runtime(self):
+        node = nodes.PiDDecodeLatent()
+        sentinel = torch.zeros((1, 8, 8, 3))
+        with mock.patch.object(nodes, "decode_latent", return_value=sentinel) as patched:
+            result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, "cat", 4, 1, 0.0)
+
+        patched.assert_called_once()
+        self.assertEqual(result, (sentinel,))
+
+    def test_encode_image_node_delegates_to_runtime(self):
+        node = nodes.PiDEncodeImage()
+        sentinel = {"samples": torch.zeros((1, 16, 8, 8))}
+        with mock.patch.object(nodes, "encode_image_to_latent", return_value=sentinel) as patched:
+            result = node.encode("model", torch.zeros((1, 64, 64, 3)))
+
+        patched.assert_called_once()
+        self.assertEqual(result, (sentinel,))
+
+    def test_encode_prompt_node_delegates_to_runtime(self):
+        node = nodes.PiDEncodePrompt()
+        sentinel = {"caption_embs": torch.zeros((1, 4, 8)), "attention_mask": torch.ones((1, 4), dtype=torch.int64)}
+        with mock.patch.object(nodes, "encode_prompt", return_value=sentinel) as patched:
+            result = node.encode("model", "cat")
+
+        patched.assert_called_once_with("model", "cat")
+        self.assertEqual(result, (sentinel,))
+
+    def test_decode_tiled_node_delegates_to_runtime(self):
+        node = nodes.PiDDecodeLatentTiled()
+        sentinel = torch.zeros((1, 64, 64, 3))
+        with mock.patch.object(nodes, "decode_latent_tiled", return_value=sentinel) as patched:
+            result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, 256, 64, "cat", 4, 1, 0.0)
+
+        patched.assert_called_once()
+        self.assertEqual(result, (sentinel,))
+
+
+if __name__ == "__main__":
+    unittest.main()

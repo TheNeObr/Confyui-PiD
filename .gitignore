@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+upstream-pid/checkpoints/
+upstream-pid/**/__pycache__/
+
+.venv/
+venv/
