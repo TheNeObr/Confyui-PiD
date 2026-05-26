@@ -45,6 +45,17 @@ Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, with
 3. Use a `LATENT` compatible with the selected backbone, or generate one with `PiD Encode Image`.
 4. Decode with `PiD Decode Latent`, `PiD Decode Latent Tiled`, or `PiD KSampler`.
 
+## Example
+
+- Example workflow: [`workflow_pid_flux2_2kto4k_tiled.json`](./workflow_pid_flux2_2kto4k_tiled.json)
+- Example output image:
+
+![PiD example output](./pid_512-2048_flux1_upscale_example.png)
+
+- Example comparison image showing input and model result:
+
+![PiD input and result comparison](./compare.png)
+
 ## Installation
 
 1. Place this folder inside `ComfyUI/custom_nodes/`.
