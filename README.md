@@ -80,6 +80,7 @@ pip install -r requirements.txt
 - The PiD runtime also loads the `Efficient-Large-Model/gemma-2-2b-it` text encoder, so the first run requires a significant amount of VRAM, RAM, and disk space.
 - This node uses CUDA. There is no practical CPU support in this wrapper.
 - This package does not keep `conditioner`, core `KSampler`, or extra experimental nodes outside the main PiD flow.
+- `upstream-pid` is a vendored minimal subset of NVIDIA PiD kept only for the runtime pieces this node uses, not the full original project.
 - `PiD Decode Latent Tiled` and `PiD KSampler` use `tile_batch_size` to process multiple same-sized tiles per call and reduce overhead.
 - `PiD KSampler` includes `keep_model_loaded_on_gpu` so you can decide whether the PiD network stays resident on GPU after sampling.
 - The decode node shows only `height x width` in a compact read-only `resolution` field below the preview, without creating extra graph outputs.
