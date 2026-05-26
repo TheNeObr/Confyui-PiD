@@ -1,134 +1,205 @@
 {
-  "last_node_id": 7,
-  "last_link_id": 8,
+  "id": "fd4b8fe7-699f-46c0-89e1-a34f72e987b5",
+  "revision": 0,
+  "last_node_id": 20,
+  "last_link_id": 36,
   "nodes": [
     {
-      "id": 1,
-      "type": "LoadImage",
-      "pos": {
-        "0": 20,
-        "1": 180
+      "id": 10,
+      "type": "Image Comparer (rgthree)",
+      "pos": [
+        1230,
+        50
+      ],
+      "size": [
+        640,
+        690
+      ],
+      "flags": {
+        "pinned": true
       },
-      "size": {
-        "0": 320,
-        "1": 314
-      },
-      "flags": {},
-      "order": 0,
+      "order": 7,
       "mode": 0,
-      "inputs": [],
-      "outputs": [
+      "inputs": [
         {
-          "name": "IMAGE",
+          "dir": 3,
+          "name": "image_a",
           "type": "IMAGE",
-          "links": [
-            4
-          ],
-          "slot_index": 0,
-          "shape": 3
+          "link": 29
         },
         {
-          "name": "MASK",
-          "type": "MASK",
-          "links": null,
-          "shape": 3
+          "dir": 3,
+          "name": "image_b",
+          "type": "IMAGE",
+          "link": 30
         }
       ],
+      "outputs": [],
       "properties": {
-        "Node name for S&R": "LoadImage"
+        "cnr_id": "rgthree-comfy",
+        "ver": "738105af5fb14e96fbecaf406dc356e284797e8c",
+        "comparer_mode": "Slide",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.8"
+        }
       },
       "widgets_values": [
-        "input.png",
-        "image"
+        [
+          {
+            "name": "A",
+            "selected": true,
+            "url": "/api/view?filename=rgthree.compare._temp_mynbi_00017_.png&type=temp&subfolder=&preview=webp&rand=0.8109287318724139"
+          },
+          {
+            "name": "B",
+            "selected": true,
+            "url": "/api/view?filename=rgthree.compare._temp_mynbi_00018_.png&type=temp&subfolder=&preview=webp&rand=0.09317657290333492"
+          }
+        ]
       ]
     },
     {
-      "id": 2,
-      "type": "PiDLoadModel",
-      "pos": {
-        "0": 20,
-        "1": 20
-      },
-      "size": {
-        "0": 260,
-        "1": 90
-      },
-      "flags": {},
-      "order": 1,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "pid_model",
-          "type": "PID_MODEL",
-          "links": [
-            1,
-            2,
-            3
-          ],
-          "slot_index": 0,
-          "shape": 3
-        }
+      "id": 20,
+      "type": "PiDKSampler",
+      "pos": [
+        780,
+        50
       ],
-      "properties": {
-        "Node name for S&R": "PiDLoadModel"
+      "size": [
+        420,
+        690
+      ],
+      "flags": {
+        "pinned": true
       },
-      "widgets_values": [
-        "flux2",
-        "2kto4k"
-      ]
-    },
-    {
-      "id": 3,
-      "type": "PiDEncodePrompt",
-      "pos": {
-        "0": 380,
-        "1": 20
-      },
-      "size": {
-        "0": 360,
-        "1": 120
-      },
-      "flags": {},
-      "order": 2,
+      "order": 4,
       "mode": 0,
       "inputs": [
         {
           "name": "pid_model",
           "type": "PID_MODEL",
-          "link": 1
+          "link": 34
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "link": 35
+        },
+        {
+          "name": "pid_prompt",
+          "shape": 7,
+          "type": "PID_PROMPT",
+          "link": null
         }
       ],
       "outputs": [
         {
-          "name": "pid_prompt",
-          "type": "PID_PROMPT",
+          "name": "image",
+          "type": "IMAGE",
           "links": [
-            5
-          ],
-          "slot_index": 0,
-          "shape": 3
+            36
+          ]
         }
       ],
       "properties": {
-        "Node name for S&R": "PiDEncodePrompt"
+        "Node name for S&R": "PiDKSampler",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.8"
+        }
       },
       "widgets_values": [
-        "ultra detailed skin texture, realistic fabric folds, sharp jewelry details, natural lighting, crisp edges, detailed hair strands, high micro-contrast, realistic materials"
+        "ultra detailed skin texture, realistic fabric folds, sharp jewelry details, natural lighting, crisp edges, detailed hair strands, high micro-contrast, realistic materials, highly detailed, sharp focus, clean edges, realistic texture, natural skin texture, detailed hair strands, fine fabric details, high micro-contrast, artifact-free, natural lighting",
+        4,
+        0,
+        "fixed",
+        0.6,
+        false,
+        512,
+        512,
+        64,
+        1,
+        ""
+      ]
+    },
+    {
+      "id": 9,
+      "type": "ImageResize+",
+      "pos": [
+        440,
+        210
+      ],
+      "size": [
+        270,
+        220
+      ],
+      "flags": {
+        "pinned": true
+      },
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 9
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            10
+          ]
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui_essentials",
+        "ver": "1.1.0",
+        "Node name for S&R": "ImageResize+",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.8"
+        }
+      },
+      "widgets_values": [
+        0,
+        1472,
+        "lanczos",
+        "keep proportion",
+        "always",
+        16
       ]
     },
     {
       "id": 4,
       "type": "PiDEncodeImage",
-      "pos": {
-        "0": 380,
-        "1": 210
+      "pos": [
+        480,
+        140
+      ],
+      "size": [
+        260,
+        50
+      ],
+      "flags": {
+        "collapsed": true
       },
-      "size": {
-        "0": 260,
-        "1": 90
-      },
-      "flags": {},
       "order": 3,
       "mode": 0,
       "inputs": [
@@ -140,53 +211,94 @@
         {
           "name": "image",
           "type": "IMAGE",
-          "link": 4
+          "link": 10
         }
       ],
       "outputs": [
         {
           "name": "latent",
           "type": "LATENT",
-          "links": [
-            6
-          ],
           "slot_index": 0,
-          "shape": 3
+          "links": [
+            35
+          ]
         }
       ],
       "properties": {
-        "Node name for S&R": "PiDEncodeImage"
-      }
+        "Node name for S&R": "PiDEncodeImage",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.8",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": []
     },
     {
-      "id": 5,
-      "type": "PiDDecodeLatentTiled",
-      "pos": {
-        "0": 760,
-        "1": 90
-      },
-      "size": {
-        "0": 360,
-        "1": 240
-      },
+      "id": 2,
+      "type": "PiDLoadModel",
+      "pos": [
+        20,
+        50
+      ],
+      "size": [
+        260,
+        90
+      ],
       "flags": {},
-      "order": 4,
+      "order": 0,
       "mode": 0,
-      "inputs": [
+      "inputs": [],
+      "outputs": [
         {
           "name": "pid_model",
           "type": "PID_MODEL",
-          "link": 3
+          "slot_index": 0,
+          "links": [
+            2,
+            34
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PiDLoadModel",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.8",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "flux2",
+        "2k"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "ColorMatch",
+      "pos": [
+        500,
+        490
+      ],
+      "size": [
+        270,
+        130
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image_ref",
+          "type": "IMAGE",
+          "link": 21
         },
         {
-          "name": "latent",
-          "type": "LATENT",
-          "link": 6
-        },
-        {
-          "name": "pid_prompt",
-          "type": "PID_PROMPT",
-          "link": 5
+          "name": "image_target",
+          "type": "IMAGE",
+          "link": 36
         }
       ],
       "outputs": [
@@ -194,92 +306,147 @@
           "name": "image",
           "type": "IMAGE",
           "links": [
-            7,
-            8
-          ],
-          "slot_index": 0,
-          "shape": 3
+            27,
+            30
+          ]
         }
       ],
       "properties": {
-        "Node name for S&R": "PiDDecodeLatentTiled"
+        "cnr_id": "comfyui-kjnodes",
+        "ver": "1.4.0",
+        "Node name for S&R": "ColorMatch",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.8"
+        }
       },
       "widgets_values": [
-        256,
-        64,
-        "",
-        1.0,
-        4,
-        0,
-        0.0
+        "hm",
+        1,
+        true
       ]
     },
     {
-      "id": 6,
-      "type": "PreviewImage",
-      "pos": {
-        "0": 1160,
-        "1": 20
-      },
-      "size": {
-        "0": 500,
-        "1": 700
-      },
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 7
-        }
+      "id": 13,
+      "type": "Image Save",
+      "pos": [
+        1230,
+        10
       ],
-      "outputs": [],
-      "properties": {
-        "Node name for S&R": "PreviewImage"
-      }
-    },
-    {
-      "id": 7,
-      "type": "SaveImage",
-      "pos": {
-        "0": 1160,
-        "1": 760
+      "size": [
+        300,
+        710
+      ],
+      "flags": {
+        "collapsed": true
       },
-      "size": {
-        "0": 320,
-        "1": 80
-      },
-      "flags": {},
       "order": 6,
       "mode": 0,
       "inputs": [
         {
           "name": "images",
           "type": "IMAGE",
-          "link": 8
+          "link": 27
         }
       ],
-      "outputs": [],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "files",
+          "type": "STRING",
+          "links": null
+        }
+      ],
       "properties": {
-        "Node name for S&R": "SaveImage"
+        "cnr_id": "pr-was-node-suite-comfyui-47064894",
+        "ver": "ea935d1044ae5a26efa54ebeb18fe9020af49a45",
+        "Node name for S&R": "Image Save",
+        "ue_properties": {
+          "version": "7.0.1",
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {}
+        },
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65
       },
       "widgets_values": [
-        "PiD_4K"
+        "PID+[time(%Y-%m-%d)]",
+        "PID",
+        "_",
+        5,
+        "false",
+        "png",
+        300,
+        100,
+        "true",
+        "false",
+        "false",
+        "false",
+        "true",
+        "true",
+        "true"
+      ]
+    },
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        20,
+        180
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            9,
+            21,
+            29
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.21.0",
+        "Node name for S&R": "LoadImage",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.8",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Hidream_00007.png",
+        "image"
       ]
     }
   ],
   "links": [
     [
-      1,
-      2,
-      0,
-      3,
-      0,
-      "PID_MODEL"
-    ],
-    [
       2,
       2,
       0,
@@ -288,51 +455,75 @@
       "PID_MODEL"
     ],
     [
-      3,
-      2,
+      9,
+      1,
       0,
-      5,
+      9,
       0,
-      "PID_MODEL"
+      "IMAGE"
     ],
     [
-      4,
-      1,
+      10,
+      9,
       0,
       4,
       1,
       "IMAGE"
     ],
     [
-      5,
-      3,
+      21,
+      1,
       0,
-      5,
-      2,
-      "PID_PROMPT"
+      12,
+      0,
+      "IMAGE"
     ],
     [
-      6,
+      27,
+      12,
+      0,
+      13,
+      0,
+      "IMAGE"
+    ],
+    [
+      29,
+      1,
+      0,
+      10,
+      0,
+      "IMAGE"
+    ],
+    [
+      30,
+      12,
+      0,
+      10,
+      1,
+      "IMAGE"
+    ],
+    [
+      34,
+      2,
+      0,
+      20,
+      0,
+      "PID_MODEL"
+    ],
+    [
+      35,
       4,
       0,
-      5,
+      20,
       1,
       "LATENT"
     ],
     [
-      7,
-      5,
+      36,
+      20,
       0,
-      6,
-      0,
-      "IMAGE"
-    ],
-    [
-      8,
-      5,
-      0,
-      7,
-      0,
+      12,
+      1,
       "IMAGE"
     ]
   ],
@@ -340,12 +531,15 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.9,
+      "scale": 1.978446689001352,
       "offset": [
-        50,
-        50
+        -543.4095901729594,
+        142.20266134681907
       ]
-    }
+    },
+    "ue_links": [],
+    "links_added_by_ue": [],
+    "frontendVersion": "1.43.18"
   },
   "version": 0.4
 }
