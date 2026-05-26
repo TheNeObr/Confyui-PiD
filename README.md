@@ -1,88 +1,91 @@
 # ComfyUI PiD
 
-Custom node para usar o `nvidia/PiD` no ComfyUI no fluxo proprio do PiD, sem depender de `PiD Conditioning` ou `KSampler`.
+Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, without relying on `PiD Conditioning` or the core `KSampler`.
 
-## O que este pacote faz
+## What This Package Does
 
-- Carrega os checkpoints oficiais do PiD para `flux`, `sd3` e `flux2`.
-- Permite pre-encode do prompt para reduzir custo repetido do text encoder.
-- Permite encode de imagem com o encoder do proprio PiD para gerar latent compativel.
-- Faz decode de `LATENT -> IMAGE` no fluxo normal ou em tiles para resolucoes maiores.
+- Loads the official PiD checkpoints for `flux`, `sd3`, and `flux2`.
+- Supports prompt pre-encoding to reduce repeated text encoder cost.
+- Supports image encoding with PiD's own encoder to generate compatible latents.
+- Decodes `LATENT -> IMAGE` in the standard flow or in tiles for larger resolutions.
 
-## Nodes mantidos
+## Included Nodes
 
 - `PiD Load Model`
-  - Seleciona `backbone` e `checkpoint_variant`.
-  - Mantem apenas o runtime ativo do modelo atual.
+  - Selects `backbone` and `checkpoint_variant`.
+  - Keeps only the current model runtime active.
 
 - `PiD Encode Prompt`
-  - Entradas: `PID_MODEL`, `prompt`.
-  - Saida: `PID_PROMPT`.
+  - Inputs: `PID_MODEL`, `prompt`.
+  - Output: `PID_PROMPT`.
 
 - `PiD Encode Image`
-  - Entradas: `PID_MODEL`, `IMAGE`.
-  - Saida: `LATENT`.
+  - Inputs: `PID_MODEL`, `IMAGE`.
+  - Output: `LATENT`.
 
 - `PiD Decode Latent`
-  - Entradas: `PID_MODEL`, `LATENT`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
-  - Entrada opcional: `PID_PROMPT`.
-  - Saida: `IMAGE`.
+  - Inputs: `PID_MODEL`, `LATENT`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
+  - Optional input: `PID_PROMPT`.
+  - Output: `IMAGE`.
 
 - `PiD Decode Latent Tiled`
-  - Entradas: `PID_MODEL`, `LATENT`, `tile_size`, `tile_overlap`, `tile_batch_size`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
-  - Entrada opcional: `PID_PROMPT`.
-  - Saida: `IMAGE`.
+  - Inputs: `PID_MODEL`, `LATENT`, `tile_size`, `tile_overlap`, `tile_batch_size`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
+  - Optional input: `PID_PROMPT`.
+  - Output: `IMAGE`.
 
 - `PiD KSampler`
-  - Entradas: `PID_MODEL`, `LATENT`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`, `use_tiled`, `tile_size`, `tile_overlap`, `tile_batch_size`.
-  - Entrada opcional: `PID_PROMPT`.
-  - Saida: `IMAGE`.
+  - Inputs: `PID_MODEL`, `LATENT`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`, `keep_model_loaded_on_gpu`, `use_tiled`, `tile_size`, `tile_overlap`, `tile_batch_size`.
+  - Optional input: `PID_PROMPT`.
+  - Output: `IMAGE`.
 
-## Fluxo recomendado
+## Recommended Flow
 
-1. Carregue o modelo com `PiD Load Model`.
-2. Se for reutilizar o mesmo prompt, use `PiD Encode Prompt`.
-3. Use um `LATENT` compativel com o backbone, ou gere um com `PiD Encode Image`.
-4. Faça o decode com `PiD Decode Latent`, `PiD Decode Latent Tiled` ou `PiD KSampler`.
+1. Load the model with `PiD Load Model`.
+2. If you plan to reuse the same prompt, use `PiD Encode Prompt`.
+3. Use a `LATENT` compatible with the selected backbone, or generate one with `PiD Encode Image`.
+4. Decode with `PiD Decode Latent`, `PiD Decode Latent Tiled`, or `PiD KSampler`.
 
-## Instalacao
+## Installation
 
-1. Coloque esta pasta dentro de `ComfyUI/custom_nodes/`.
-2. Instale as dependencias no ambiente do ComfyUI:
+1. Place this folder inside `ComfyUI/custom_nodes/`.
+2. Install the dependencies in the ComfyUI environment:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Reinicie o ComfyUI.
+3. Restart ComfyUI.
 
-## Backbones suportados
+## Supported Backbones
 
 - `flux`
 - `sd3`
 - `flux2`
 
-## Observacoes importantes
+## Important Notes
 
-- O backbone escolhido no `PiD Load Model` precisa combinar com a familia do latent.
-- O primeiro carregamento baixa pesos do repositorio [`nvidia/PiD`](https://huggingface.co/nvidia/PiD).
-- O runtime do PiD tambem carrega o text encoder `Efficient-Large-Model/gemma-2-2b-it`, entao o primeiro uso exige bastante VRAM, RAM e disco.
-- O node usa CUDA. Nao ha suporte pratico a CPU neste wrapper.
-- Este pacote nao mantem nodes de `conditioner`, `KSampler` ou nodes experimentais fora do fluxo principal do PiD.
-- O `PiD Decode Latent Tiled` e o `PiD KSampler` usam `tile_batch_size` para processar varios tiles iguais por chamada e reduzir overhead.
-- O modelo `nvidia/PiD` tem termos de uso proprios da NVIDIA. Confira a licenca no card do modelo antes de distribuir ou usar em producao.
+- The backbone selected in `PiD Load Model` must match the latent family.
+- The first load downloads weights from the [`nvidia/PiD`](https://huggingface.co/nvidia/PiD) repository.
+- The PiD runtime also loads the `Efficient-Large-Model/gemma-2-2b-it` text encoder, so the first run requires a significant amount of VRAM, RAM, and disk space.
+- This node uses CUDA. There is no practical CPU support in this wrapper.
+- This package does not keep `conditioner`, core `KSampler`, or extra experimental nodes outside the main PiD flow.
+- `PiD Decode Latent Tiled` and `PiD KSampler` use `tile_batch_size` to process multiple same-sized tiles per call and reduce overhead.
+- `PiD KSampler` includes `keep_model_loaded_on_gpu` so you can decide whether the PiD network stays resident on GPU after sampling.
+- The decode node shows only `height x width` in a compact read-only `resolution` field below the preview, without creating extra graph outputs.
+- Small tiles such as `256` are decoded with extra internal context before the final crop to reduce green tint and color collapse.
+- The `nvidia/PiD` model has its own NVIDIA usage terms. Check the model card license before distributing or using it in production.
 
-## Validacao local
+## Local Validation
 
-Os testes unitarios deste repositorio validam:
+The unit tests in this repository validate:
 
-- contrato dos nodes do ComfyUI;
-- conversao de `LATENT` para `IMAGE`;
-- validacao de canais por backbone;
-- encode de imagem e cache de prompt;
-- chamada correta do runtime com mocks.
+- ComfyUI node contracts;
+- `LATENT` to `IMAGE` conversion;
+- channel validation per backbone;
+- image encoding and prompt cache behavior;
+- correct runtime delegation with mocks.
 
-Executar:
+Run:
 
 ```bash
 python -m unittest discover -s tests -v

@@ -24,6 +24,9 @@ SUPPORTED_LATENT_INTERPOLATIONS = ("nearest-exact", "bilinear", "bicubic", "area
 LATENT_CHANNELS = {"flux": 16, "sd3": 16, "flux2": 128}
 LATENT_COMPRESSION = {"flux": 8, "sd3": 8, "flux2": 16}
 MAX_PROMPT_CACHE_ITEMS = 8
+# Tiles muito pequenos tendem a colapsar a cor no PiD; decodificamos com contexto maior
+# e recortamos o centro para manter a saida pedida sem o desvio verde.
+MIN_TILED_DECODE_SIZE = 512
 
 _HANDLE_CACHE: dict[tuple[str, str], "PiDHandle"] = {}
 _PROMPT_CACHE: "OrderedDict[tuple[str, str, str], PiDPrompt]" = OrderedDict()
@@ -84,6 +87,22 @@ class _TileDecodeJob:
     end_x: int
     out_y: int
     out_x: int
+
+
+@dataclass(frozen=True)
+class _ExpandedTileDecodeJob:
+    target_start_y: int
+    target_start_x: int
+    target_end_y: int
+    target_end_x: int
+    decode_start_y: int
+    decode_start_x: int
+    decode_end_y: int
+    decode_end_x: int
+    out_y: int
+    out_x: int
+    crop_y: int
+    crop_x: int
 
 
 def _ensure_upstream_path() -> None:
@@ -191,12 +210,28 @@ def _offload_aux_modules(model: Any) -> None:
     _empty_cuda_cache()
 
 
+def _set_runtime_net_device(model: Any, device: str, precision: torch.dtype | None = None) -> None:
+    net = getattr(model, "net", None)
+    if net is None:
+        return
+
+    try:
+        if precision is not None:
+            model.net = net.to(device=device, dtype=precision)
+        else:
+            model.net = net.to(device=device)
+    except TypeError:
+        model.net = net.to(device=device)
+
+    _set_module_eval(model.net)
+    _disable_module_grads(model.net)
+    if device == "cpu":
+        _empty_cuda_cache()
+
+
 def _prepare_model_for_inference(model: Any) -> None:
     precision = getattr(model, "precision", torch.float32)
-    if hasattr(model, "net") and model.net is not None:
-        model.net = model.net.to(device="cuda", dtype=precision)
-        _set_module_eval(model.net)
-        _disable_module_grads(model.net)
+    _set_runtime_net_device(model, "cuda", precision=precision)
     if getattr(model, "text_encoder", None) is not None:
         _set_module_eval(model.text_encoder)
         _disable_module_grads(model.text_encoder)
@@ -502,6 +537,57 @@ def _iter_tile_jobs(
     return jobs
 
 
+def _expand_tile_axis(start: int, end: int, total: int, min_size: int) -> tuple[int, int]:
+    current = end - start
+    target = min(total, max(current, min_size))
+    extra = target - current
+    if extra <= 0:
+        return start, end
+
+    before = min(start, extra // 2)
+    after = min(total - end, extra - before)
+    missing = extra - before - after
+    if missing > 0:
+        grow_before = min(start - before, missing)
+        before += grow_before
+        missing -= grow_before
+    if missing > 0:
+        grow_after = min(total - end - after, missing)
+        after += grow_after
+
+    return start - before, end + after
+
+
+def _expand_tile_job(
+    job: _TileDecodeJob,
+    total_h: int,
+    total_w: int,
+    compression: int,
+    pid_scale: int,
+) -> _ExpandedTileDecodeJob:
+    min_decode_latent = max(1, MIN_TILED_DECODE_SIZE // compression)
+    decode_start_y, decode_end_y = _expand_tile_axis(job.start_y, job.end_y, total_h, min_decode_latent)
+    decode_start_x, decode_end_x = _expand_tile_axis(job.start_x, job.end_x, total_w, min_decode_latent)
+
+    crop_y = (job.start_y - decode_start_y) * compression * pid_scale
+    crop_x = (job.start_x - decode_start_x) * compression * pid_scale
+
+    return _ExpandedTileDecodeJob(
+        target_start_y=job.start_y,
+        target_start_x=job.start_x,
+        target_end_y=job.end_y,
+        target_end_x=job.end_x,
+        decode_start_y=decode_start_y,
+        decode_start_x=decode_start_x,
+        decode_end_y=decode_end_y,
+        decode_end_x=decode_end_x,
+        out_y=job.out_y,
+        out_x=job.out_x,
+        crop_y=crop_y,
+        crop_x=crop_x,
+    )
+
+
 def _decode_samples(
     handle: PiDHandle,
     latent_tensor: torch.Tensor,
@@ -530,6 +616,7 @@ def _decode_samples(
     batch_size = int(latent_tensor.shape[0])
 
     precision = getattr(model, "precision", torch.float32)
+    _set_runtime_net_device(model, device, precision=precision)
     caption_embs = pid_prompt.caption_embs
     if caption_embs.ndim != 3:
         raise ValueError(f"caption_embs invalido para PiD: {tuple(caption_embs.shape)}.")
@@ -750,6 +837,16 @@ def decode_latent_tiled(
     tile_latent = tile_size // compression
     overlap_latent = tile_overlap // compression
     tile_jobs = _iter_tile_jobs(latent_tensor, compression, handle.pid_scale, tile_latent, overlap_latent)
+    expanded_jobs = [
+        _expand_tile_job(
+            job=job,
+            total_h=int(latent_tensor.shape[-2]),
+            total_w=int(latent_tensor.shape[-1]),
+            compression=compression,
+            pid_scale=handle.pid_scale,
+        )
+        for job in tile_jobs
+    ]
 
     baseline_h = int(latent_tensor.shape[-2]) * compression
     baseline_w = int(latent_tensor.shape[-1]) * compression
@@ -762,7 +859,7 @@ def decode_latent_tiled(
     weight_sum = torch.zeros((batch_size, output_h, output_w, 1), dtype=torch.float32)
 
     prompt_value = _normalize_pid_prompt(pid_prompt) if pid_prompt is not None else _encode_prompt_once(handle, prompt)
-    tile_count = len(tile_jobs)
+    tile_count = len(expanded_jobs)
     effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else 4
     progress = _DecodeProgress(total=max(1, tile_count * max(1, effective_steps)), node_id=unique_id)
     model = _get_model(handle)
@@ -771,22 +868,22 @@ def decode_latent_tiled(
 
     index = 0
     while index < tile_count:
-        first_job = tile_jobs[index]
-        first_h = first_job.end_y - first_job.start_y
-        first_w = first_job.end_x - first_job.start_x
+        first_job = expanded_jobs[index]
+        first_h = first_job.decode_end_y - first_job.decode_start_y
+        first_w = first_job.decode_end_x - first_job.decode_start_x
         job_batch = [first_job]
         index += 1
 
         while index < tile_count and len(job_batch) < tile_batch_size:
-            candidate = tile_jobs[index]
-            if (candidate.end_y - candidate.start_y, candidate.end_x - candidate.start_x) != (first_h, first_w):
+            candidate = expanded_jobs[index]
+            if (candidate.decode_end_y - candidate.decode_start_y, candidate.decode_end_x - candidate.decode_start_x) != (first_h, first_w):
                 break
             job_batch.append(candidate)
             index += 1
 
         latent_batch = torch.cat(
             [
-                latent_tensor[:, :, job.start_y : job.end_y, job.start_x : job.end_x].contiguous()
+                latent_tensor[:, :, job.decode_start_y : job.decode_end_y, job.decode_start_x : job.decode_end_x].contiguous()
                 for job in job_batch
             ],
             dim=0,
@@ -796,8 +893,8 @@ def decode_latent_tiled(
                 full_noise[
                     :,
                     :,
-                    job.out_y : job.out_y + (job.end_y - job.start_y) * compression * handle.pid_scale,
-                    job.out_x : job.out_x + (job.end_x - job.start_x) * compression * handle.pid_scale,
+                    job.decode_start_y * compression * handle.pid_scale : job.decode_end_y * compression * handle.pid_scale,
+                    job.decode_start_x * compression * handle.pid_scale : job.decode_end_x * compression * handle.pid_scale,
                 ].contiguous()
                 for job in job_batch
             ],
@@ -820,16 +917,19 @@ def decode_latent_tiled(
 
         for offset, job in enumerate(job_batch):
             tile_image = tile_images[offset * batch_size : (offset + 1) * batch_size]
+            target_h = (job.target_end_y - job.target_start_y) * compression * handle.pid_scale
+            target_w = (job.target_end_x - job.target_start_x) * compression * handle.pid_scale
+            tile_image = tile_image[:, job.crop_y : job.crop_y + target_h, job.crop_x : job.crop_x + target_w, :]
             tile_h = int(tile_image.shape[1])
             tile_w = int(tile_image.shape[2])
             weight = _tile_weight_mask(
                 height=tile_h,
                 width=tile_w,
                 overlap=min(overlap_out, tile_h // 2, tile_w // 2),
-                top_edge=job.start_y == 0,
-                bottom_edge=job.end_y == int(latent_tensor.shape[-2]),
-                left_edge=job.start_x == 0,
-                right_edge=job.end_x == int(latent_tensor.shape[-1]),
+                top_edge=job.target_start_y == 0,
+                bottom_edge=job.target_end_y == int(latent_tensor.shape[-2]),
+                left_edge=job.target_start_x == 0,
+                right_edge=job.target_end_x == int(latent_tensor.shape[-1]),
                 device=tile_image.device,
             )
             output[:, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w, :] += tile_image * weight
@@ -860,6 +960,7 @@ def pid_ksampler(
     pid_inference_steps: int,
     seed: int,
     degrade_sigma: float,
+    keep_model_loaded_on_gpu: bool = True,
     use_tiled: bool = False,
     tile_size: int = 256,
     tile_overlap: int = 64,
@@ -867,8 +968,24 @@ def pid_ksampler(
     pid_prompt: Any = None,
     unique_id: str | None = None,
 ) -> torch.Tensor:
-    if use_tiled:
-        return decode_latent_tiled(
+    try:
+        if use_tiled:
+            return decode_latent_tiled(
+                handle=handle,
+                latent=latent,
+                prompt=prompt,
+                cfg_scale=1.0,
+                pid_inference_steps=pid_inference_steps,
+                seed=seed,
+                degrade_sigma=degrade_sigma,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
+                tile_batch_size=tile_batch_size,
+                pid_prompt=pid_prompt,
+                unique_id=unique_id,
+            )
+
+        return decode_latent(
             handle=handle,
             latent=latent,
             prompt=prompt,
@@ -876,21 +993,10 @@ def pid_ksampler(
             pid_inference_steps=pid_inference_steps,
             seed=seed,
             degrade_sigma=degrade_sigma,
-            tile_size=tile_size,
-            tile_overlap=tile_overlap,
-            tile_batch_size=tile_batch_size,
             pid_prompt=pid_prompt,
             unique_id=unique_id,
         )
-
-    return decode_latent(
-        handle=handle,
-        latent=latent,
-        prompt=prompt,
-        cfg_scale=1.0,
-        pid_inference_steps=pid_inference_steps,
-        seed=seed,
-        degrade_sigma=degrade_sigma,
-        pid_prompt=pid_prompt,
-        unique_id=unique_id,
-    )
+    finally:
+        if not keep_model_loaded_on_gpu:
+            model = _get_model(handle)
+            _set_runtime_net_device(model, "cpu")

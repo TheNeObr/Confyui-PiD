@@ -12,6 +12,16 @@ from .pid_runtime import (
 )
 
 
+def _format_image_resolution(image) -> str:
+    height = int(image.shape[1])
+    width = int(image.shape[2])
+    return f"{height} x {width}"
+
+
+def _with_resolution_ui(image):
+    return {"ui": {"text": (_format_image_resolution(image),)}, "result": (image,)}
+
+
 class PiDLoadModel:
     CATEGORY = "PiD"
     FUNCTION = "load_model"
@@ -78,7 +88,7 @@ class PiDDecodeLatent:
             pid_prompt=pid_prompt,
             unique_id=unique_id,
         )
-        return (image,)
+        return _with_resolution_ui(image)
 
 
 class PiDEncodeImage:
@@ -135,6 +145,7 @@ class PiDKSampler:
                 "pid_inference_steps": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "degrade_sigma": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "keep_model_loaded_on_gpu": ("BOOLEAN", {"default": True}),
                 "use_tiled": ("BOOLEAN", {"default": False}),
                 "tile_size": ("INT", {"default": 256, "min": 64, "max": 2048, "step": 64}),
                 "tile_overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8}),
@@ -156,6 +167,7 @@ class PiDKSampler:
         pid_inference_steps: int,
         seed: int,
         degrade_sigma: float,
+        keep_model_loaded_on_gpu: bool,
         use_tiled: bool,
         tile_size: int,
         tile_overlap: int,
@@ -170,6 +182,7 @@ class PiDKSampler:
             pid_inference_steps=pid_inference_steps,
             seed=seed,
             degrade_sigma=degrade_sigma,
+            keep_model_loaded_on_gpu=keep_model_loaded_on_gpu,
             use_tiled=use_tiled,
             tile_size=tile_size,
             tile_overlap=tile_overlap,
@@ -177,7 +190,7 @@ class PiDKSampler:
             pid_prompt=pid_prompt,
             unique_id=unique_id,
         )
-        return (image,)
+        return _with_resolution_ui(image)
 
 
 class PiDDecodeLatentTiled:
@@ -236,7 +249,7 @@ class PiDDecodeLatentTiled:
             pid_prompt=pid_prompt,
             unique_id=unique_id,
         )
-        return (image,)
+        return _with_resolution_ui(image)
 
 
 NODE_CLASS_MAPPINGS = {

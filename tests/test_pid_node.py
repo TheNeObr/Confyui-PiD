@@ -186,6 +186,23 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertEqual(tuple(image.shape), (1, 128, 128, 3))
         self.assertTrue(torch.allclose(image, torch.ones_like(image)))
 
+    def test_small_tiled_decode_expands_context_window(self):
+        base_job = pid_runtime._TileDecodeJob(start_y=32, start_x=32, end_y=64, end_x=64, out_y=1024, out_x=1024)
+        expanded = pid_runtime._expand_tile_job(
+            job=base_job,
+            total_h=128,
+            total_w=128,
+            compression=8,
+            pid_scale=4,
+        )
+
+        self.assertLess(expanded.decode_start_y, base_job.start_y)
+        self.assertLess(expanded.decode_start_x, base_job.start_x)
+        self.assertGreater(expanded.decode_end_y, base_job.end_y)
+        self.assertGreater(expanded.decode_end_x, base_job.end_x)
+        self.assertEqual(expanded.crop_y, (base_job.start_y - expanded.decode_start_y) * 32)
+        self.assertEqual(expanded.crop_x, (base_job.start_x - expanded.decode_start_x) * 32)
+
     def test_decode_latent_tiled_validates_tile_alignment(self):
         handle = self._register_runtime(DummyModel(), backbone="flux2", latent_channels=128, latent_compression=16)
 
@@ -213,6 +230,7 @@ class PiDRuntimeTests(unittest.TestCase):
             pid_inference_steps=4,
             seed=0,
             degrade_sigma=0.0,
+            keep_model_loaded_on_gpu=True,
             use_tiled=True,
             tile_size=16,
             tile_overlap=8,
@@ -220,6 +238,24 @@ class PiDRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(tuple(image.shape), (1, 128, 128, 3))
+
+    def test_pid_ksampler_can_offload_model_net_after_sampling(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+
+        with mock.patch.object(pid_runtime, "_set_runtime_net_device") as patched_device:
+            pid_runtime.pid_ksampler(
+                handle=handle,
+                latent={"samples": torch.zeros((1, 16, 2, 2), dtype=torch.float32)},
+                prompt="cat",
+                pid_inference_steps=4,
+                seed=0,
+                degrade_sigma=0.0,
+                keep_model_loaded_on_gpu=False,
+                use_tiled=False,
+            )
+
+        self.assertTrue(any(call.args[1] == "cpu" for call in patched_device.call_args_list))
 
     def test_resize_latent_resizes_dict_samples(self):
         latent = {
@@ -279,7 +315,8 @@ class PiDNodeTests(unittest.TestCase):
             result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, "cat", 4, 1, 0.0)
 
         patched.assert_called_once()
-        self.assertEqual(result, (sentinel,))
+        self.assertEqual(result["result"], (sentinel,))
+        self.assertEqual(result["ui"]["text"], ("8 x 8",))
 
     def test_encode_image_node_delegates_to_runtime(self):
         node = nodes.PiDEncodeImage()
@@ -306,16 +343,18 @@ class PiDNodeTests(unittest.TestCase):
             result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, 256, 64, 2, "cat", 4, 1, 0.0)
 
         patched.assert_called_once()
-        self.assertEqual(result, (sentinel,))
+        self.assertEqual(result["result"], (sentinel,))
+        self.assertEqual(result["ui"]["text"], ("64 x 64",))
 
     def test_pid_ksampler_node_delegates_to_runtime(self):
         node = nodes.PiDKSampler()
         sentinel = torch.zeros((1, 64, 64, 3))
         with mock.patch.object(nodes, "pid_ksampler", return_value=sentinel) as patched:
-            result = node.sample("model", {"samples": torch.zeros((1, 16, 2, 2))}, "cat", 4, 1, 0.0, True, 256, 64, 2)
+            result = node.sample("model", {"samples": torch.zeros((1, 16, 2, 2))}, "cat", 4, 1, 0.0, True, True, 256, 64, 2)
 
         patched.assert_called_once()
-        self.assertEqual(result, (sentinel,))
+        self.assertEqual(result["result"], (sentinel,))
+        self.assertEqual(result["ui"]["text"], ("64 x 64",))
 
 
 if __name__ == "__main__":
