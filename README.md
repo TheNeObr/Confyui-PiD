@@ -104,6 +104,12 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 - `PiD KSampler` includes `keep_model_loaded_on_gpu` so you can decide whether the PiD network stays resident on GPU after sampling.
 - The decode node shows only `height x width` in a compact read-only `resolution` field below the preview, without creating extra graph outputs.
 - Small tiles such as `256` are decoded with extra internal context before the final crop to reduce green tint and color collapse.
+- Green artifacts can also appear in non-tiled decoding when aspect-ratio changes or custom resolutions push the latent outside the model's most stable size/alignment range. This is not limited to `4:3`; the bigger issue is usually latent/grid alignment and using a checkpoint variant outside the resolution range where it is most stable.
+- As a practical rule, `2k` is usually the safer choice around a `512` base workflow, while `2kto4k` is usually the safer choice around a `1024` base workflow.
+- Using the `2k` checkpoint variant with `1024` in direct non-tiled decoding can still be accepted by the model, but it is more likely to produce green artifacts, color collapse, or unstable results than the same workflow at `512`.
+- Tiled decoding is often more stable at larger resolutions because the model processes smaller local regions instead of one large full-frame decode, so `1024` and larger outputs tend to behave better in tiled mode than in direct mode.
+- For best stability, prefer generating or encoding directly at the target aspect ratio and keep dimensions aligned to the backbone: multiples of `32` are safer for `flux` and `sd3`, and multiples of `64` are safer for `flux2`.
+- For `flux2`, the encode path is especially strict because the VAE uses an effective `16x` spatial compression and an internal `2x2` patchification step, so dimensions that drift away from the safe multiples are more likely to fail or produce unstable colors.
 - The `nvidia/PiD` model has its own NVIDIA usage terms. Check the model card license before distributing or using it in production.
 
 ## Local Validation
