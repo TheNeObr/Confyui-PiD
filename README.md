@@ -73,6 +73,15 @@ pip install -r requirements.txt
 - `sd3`
 - `flux2`
 
+## Official Resources And Disclaimer
+
+- Official model repository: [`nvidia/PiD` on Hugging Face](https://huggingface.co/nvidia/PiD)
+- Official PiD source repository: [`nv-tlabs/PiD` on GitHub](https://github.com/nv-tlabs/PiD)
+- The released PiD models are subject to NVIDIA's own model license and usage terms. Always review the official model card and license before downloading, using, sharing, or adapting any of the provided weights.
+- This custom node is developed for personal use and experimentation in a controlled environment.
+- Running this node, downloading the models, and using them on your own hardware is the sole responsibility of each user.
+- Any use outside the applicable model license terms, usage restrictions, or deployment limitations is the sole responsibility of the user who chooses to do so.
+
 ## Important Notes
 
 - The backbone selected in `PiD Load Model` must match the latent family.
