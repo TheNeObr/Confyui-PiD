@@ -78,6 +78,9 @@ pip install -r requirements.txt
 - The backbone selected in `PiD Load Model` must match the latent family.
 - The first load downloads weights from the [`nvidia/PiD`](https://huggingface.co/nvidia/PiD) repository.
 - The PiD runtime also loads the `Efficient-Large-Model/gemma-2-2b-it` text encoder, so the first run requires a significant amount of VRAM, RAM, and disk space.
+- Development and validation for this custom node were tested on an NVIDIA RTX 3090.
+- The recommended minimum GPU memory for practical use is 16 GB of VRAM.
+- Environments with 12 GB or 8 GB of VRAM were not tested, but they may still work depending on the workflow and settings used.
 - This node uses CUDA. There is no practical CPU support in this wrapper.
 - This package does not keep `conditioner`, core `KSampler`, or extra experimental nodes outside the main PiD flow.
 - `upstream-pid` is a vendored minimal subset of NVIDIA PiD kept only for the runtime pieces this node uses, not the full original project.
