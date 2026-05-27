@@ -34,7 +34,7 @@ nodes = _load_package_module("nodes", "nodes.py")
 
 
 class DummyModel:
-    def __init__(self):
+    def __init__(self, encode_latent_channels=16, encode_compression=8):
         self.config = types.SimpleNamespace(input_caption_key="caption")
         self.last_caption_embs = None
         self.last_lq_latent = None
@@ -46,6 +46,8 @@ class DummyModel:
         self.net = mock.Mock(side_effect=lambda x, *args, **kwargs: torch.zeros_like(x))
         self.text_encoder = mock.Mock()
         self.vae_encoder = mock.Mock()
+        self.encode_latent_channels = int(encode_latent_channels)
+        self.encode_compression = int(encode_compression)
 
     def eval(self):
         return self
@@ -76,7 +78,11 @@ class DummyModel:
     def encode_lq_latent(self, image):
         self.last_image = image
         batch, _, height, width = image.shape
-        return torch.zeros((batch, 16, height // 8, width // 8), dtype=torch.float32, device=image.device)
+        return torch.zeros(
+            (batch, self.encode_latent_channels, height // self.encode_compression, width // self.encode_compression),
+            dtype=torch.float32,
+            device=image.device,
+        )
 
 
 class PiDRuntimeTests(unittest.TestCase):
@@ -146,6 +152,30 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertEqual(tuple(latent["samples"].shape), (1, 16, 8, 12))
         self.assertEqual(tuple(model.last_image.shape), (1, 3, 64, 96))
         self.assertTrue(torch.allclose(model.last_image, torch.ones_like(model.last_image)))
+
+    def test_encode_image_to_latent_autocorrects_flux_alignment(self):
+        model = DummyModel()
+        handle = self._register_runtime(model, backbone="flux", latent_channels=16, latent_compression=8)
+
+        latent = pid_runtime.encode_image_to_latent(
+            handle=handle,
+            image=torch.ones((1, 70, 95, 3), dtype=torch.float32),
+        )
+
+        self.assertEqual(tuple(model.last_image.shape), (1, 3, 64, 96))
+        self.assertEqual(tuple(latent["samples"].shape), (1, 16, 8, 12))
+
+    def test_encode_image_to_latent_autocorrects_flux2_alignment(self):
+        model = DummyModel(encode_latent_channels=128, encode_compression=16)
+        handle = self._register_runtime(model, backbone="flux2", latent_channels=128, latent_compression=16)
+
+        latent = pid_runtime.encode_image_to_latent(
+            handle=handle,
+            image=torch.ones((1, 1000, 1537, 3), dtype=torch.float32),
+        )
+
+        self.assertEqual(tuple(model.last_image.shape), (1, 3, 1024, 1536))
+        self.assertEqual(tuple(latent["samples"].shape), (1, 128, 64, 96))
 
     def test_decode_latent_tiled_blends_tiles_into_full_image(self):
         model = DummyModel()

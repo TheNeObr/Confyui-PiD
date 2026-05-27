@@ -402,9 +402,70 @@ def _extract_image_tensor(image: Any) -> torch.Tensor:
     return image
 
 
+def _nearest_multiple(value: int, alignment: int) -> int:
+    if alignment <= 1:
+        return max(1, int(value))
+
+    lower = max(alignment, (int(value) // alignment) * alignment)
+    upper = max(alignment, ((int(value) + alignment - 1) // alignment) * alignment)
+    if abs(int(value) - lower) <= abs(upper - int(value)):
+        return lower
+    return upper
+
+
+def _pick_aligned_image_size(height: int, width: int, alignment: int) -> tuple[int, int]:
+    if alignment <= 1:
+        return max(1, int(height)), max(1, int(width))
+
+    if height % alignment == 0 and width % alignment == 0:
+        return int(height), int(width)
+
+    candidates: list[tuple[int, int]] = []
+
+    target_h = _nearest_multiple(height, alignment)
+    scaled_w = max(1, int(round(width * (target_h / max(1, height)))))
+    candidates.append((target_h, _nearest_multiple(scaled_w, alignment)))
+
+    target_w = _nearest_multiple(width, alignment)
+    scaled_h = max(1, int(round(height * (target_w / max(1, width)))))
+    candidates.append((_nearest_multiple(scaled_h, alignment), target_w))
+
+    # Fall back to direct rounding on both axes if the scale-anchored candidates
+    # still drift too much on extreme aspect ratios.
+    candidates.append((_nearest_multiple(height, alignment), _nearest_multiple(width, alignment)))
+
+    base_ratio = float(height) / float(width)
+
+    def _score(size: tuple[int, int]) -> tuple[float, float, float, int]:
+        target_height, target_width = size
+        scale_y = target_height / float(height)
+        scale_x = target_width / float(width)
+        ratio_error = abs((target_height / float(target_width)) - base_ratio) / max(base_ratio, 1e-8)
+        anisotropy = abs(scale_y - scale_x)
+        scale_change = abs(scale_y - 1.0) + abs(scale_x - 1.0)
+        area_delta = abs((target_height * target_width) - (height * width))
+        return (ratio_error, anisotropy, scale_change, area_delta)
+
+    return min(candidates, key=_score)
+
+
+def _autocorrect_encode_image_tensor(handle: PiDHandle, image_tensor: torch.Tensor) -> torch.Tensor:
+    height = int(image_tensor.shape[1])
+    width = int(image_tensor.shape[2])
+    alignment = max(1, int(handle.latent_compression * handle.pid_scale))
+    target_height, target_width = _pick_aligned_image_size(height, width, alignment)
+
+    if (target_height, target_width) == (height, width):
+        return image_tensor
+
+    chw_image = image_tensor.permute(0, 3, 1, 2).contiguous()
+    resized = _resize_spatial_tensor(chw_image, (target_height, target_width), "bilinear")
+    return resized.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
+
+
 def encode_image_to_latent(handle: PiDHandle, image: Any) -> dict[str, torch.Tensor]:
     model = _get_model(handle)
-    image_tensor = _extract_image_tensor(image)
+    image_tensor = _autocorrect_encode_image_tensor(handle, _extract_image_tensor(image))
 
     chw_image = image_tensor.permute(0, 3, 1, 2).contiguous()
     vae_input = (chw_image * 2.0 - 1.0).clamp(-1.0, 1.0).to(device=handle.device, dtype=torch.float32)
