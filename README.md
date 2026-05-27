@@ -66,6 +66,12 @@ pip install -r requirements.txt
 ```
 
 3. Restart ComfyUI.
+4. When the PiD weights are downloaded automatically, they are stored inside this custom node folder under `upstream-pid/checkpoints/`.
+5. In a typical ComfyUI installation, that means the files will be saved to:
+
+```text
+ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
+```
 
 ## Supported Backbones
 
@@ -86,6 +92,7 @@ pip install -r requirements.txt
 
 - The backbone selected in `PiD Load Model` must match the latent family.
 - The first load downloads weights from the [`nvidia/PiD`](https://huggingface.co/nvidia/PiD) repository.
+- Downloaded PiD checkpoint files are stored locally in `upstream-pid/checkpoints/` inside this custom node directory.
 - The PiD runtime also loads the `Efficient-Large-Model/gemma-2-2b-it` text encoder, so the first run requires a significant amount of VRAM, RAM, and disk space.
 - Development and validation for this custom node were tested on an NVIDIA RTX 3090.
 - The recommended minimum GPU memory for practical use is 16 GB of VRAM.
