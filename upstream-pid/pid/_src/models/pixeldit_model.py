@@ -143,35 +143,44 @@ class PixelDiTModel(ImaginaireModel):
         with misc.timer("PixelDiTModel: build_net"):
             self.net = lazy_instantiate(config.net)
             self.net = self.net.to(device="cuda", dtype=torch.float32)
-            self.net.requires_grad_(True)
-            if hasattr(self.net, "init_weights"):
-                self.net.init_weights()
+            self.net.requires_grad_(False)
             logger.info(f"PixDiT_T2I params: {sum(p.numel() for p in self.net.parameters()):,}")
 
-        # Frozen text encoder. Use object.__setattr__ so DCP / nn.Module don't try to
-        # register it as a child / save it in state_dict.
-        with misc.timer("PixelDiTModel: load_text_encoder"):
-            _tokenizer, _text_encoder = _load_text_encoder(config.text_encoder_name, device="cuda")
-            object.__setattr__(self, "tokenizer", _tokenizer)
-            object.__setattr__(self, "text_encoder", _text_encoder)
-            self._chi_prompt_str = "\n".join(config.chi_prompt) if config.chi_prompt else ""
-            self._num_chi_tokens = len(self.tokenizer.encode(self._chi_prompt_str)) if self._chi_prompt_str else 0
-            self._null_caption_embs = self._encode_text_raw([config.negative_prompt if config.negative_prompt else ""])[
-                0
-            ]
+        # Load the text encoder lazily so "Load Model" doesn't immediately pay the
+        # Gemma VRAM/time cost when the workflow only needs latent decode paths.
+        object.__setattr__(self, "tokenizer", None)
+        object.__setattr__(self, "text_encoder", None)
+        self._chi_prompt_str = "\n".join(config.chi_prompt) if config.chi_prompt else ""
+        self._num_chi_tokens = 0
+        self._null_caption_embs = None
 
         # Tiny flow-matching shim: only `timescale` is consumed by inference.
         self.fm_trainer = _FlowMatchingTimescale(config.fm_timescale)
 
-        self.conditioner = lazy_instantiate(config.conditioner)
-        logger.info(f"PixelDiT conditioner: {self.conditioner}")
+        # The custom node feeds caption embeddings/LQ latent directly and never uses
+        # the training-time conditioner object.
+        self.conditioner = None
+        if config.conditioner is not None:
+            logger.info("Skipping PixelDiT conditioner instantiation for inference runtime.")
 
     # ---------------------------------------------------------------------
     # Text encoding
     # ---------------------------------------------------------------------
 
+    def _ensure_text_encoder_loaded(self) -> None:
+        if getattr(self, "tokenizer", None) is not None and getattr(self, "text_encoder", None) is not None:
+            return
+
+        with misc.timer("PixelDiTModel: load_text_encoder"):
+            _tokenizer, _text_encoder = _load_text_encoder(self.config.text_encoder_name, device="cuda")
+            object.__setattr__(self, "tokenizer", _tokenizer)
+            object.__setattr__(self, "text_encoder", _text_encoder)
+            self._num_chi_tokens = len(_tokenizer.encode(self._chi_prompt_str)) if self._chi_prompt_str else 0
+
     @torch.no_grad()
     def _encode_text_raw(self, captions: list[str]) -> tuple[Tensor, Tensor]:
+        self._ensure_text_encoder_loaded()
+
         if self._chi_prompt_str:
             prompts_all = [self._chi_prompt_str + cap for cap in captions]
             max_length_all = self._num_chi_tokens + self.config.model_max_length - 2

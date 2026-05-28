@@ -44,18 +44,25 @@ class PidModel(PixelDiTModel):
     def __init__(self, config: PidModelConfig):
         super().__init__(config)
 
-        if config.tokenizer is not None:
-            with misc.timer("PidModel: load_vae"):
-                from pid._src.tokenizers.base_vae import BaseVAE
-
-                self.vae_encoder: BaseVAE = lazy_instantiate(config.tokenizer)
-                if config.state_ch > 0:
-                    assert self.vae_encoder.latent_ch == config.state_ch, (
-                        f"latent_ch {self.vae_encoder.latent_ch} != state_ch {config.state_ch}"
-                    )
-        else:
-            self.vae_encoder = None
+        self._vae_config = config.tokenizer
+        self.vae_encoder = None
+        if config.tokenizer is None:
             logger.warning("No VAE configured — LQ latent encoding disabled.")
+
+    def _ensure_vae_encoder_loaded(self) -> None:
+        if self.vae_encoder is not None:
+            return
+        if self._vae_config is None:
+            raise RuntimeError("No VAE configured — LQ latent encoding disabled.")
+
+        with misc.timer("PidModel: load_vae"):
+            from pid._src.tokenizers.base_vae import BaseVAE
+
+            self.vae_encoder = lazy_instantiate(self._vae_config)
+            if self.config.state_ch > 0:
+                assert self.vae_encoder.latent_ch == self.config.state_ch, (
+                    f"latent_ch {self.vae_encoder.latent_ch} != state_ch {self.config.state_ch}"
+                )
 
     @torch.no_grad()
     def encode_lq_latent(self, lq_image: Tensor) -> Tensor:
@@ -67,6 +74,7 @@ class PidModel(PixelDiTModel):
         Returns:
             LQ latent [B, z_dim, zH, zW].
         """
+        self._ensure_vae_encoder_loaded()
         if lq_image.ndim == 4:
             lq_image = lq_image.unsqueeze(2)
         latent = self.vae_encoder.encode(lq_image)

@@ -58,6 +58,170 @@ class _PiDLoadedRuntime:
     model: Any
 
 
+@dataclass(frozen=True)
+class _LightPiDConfig:
+    input_caption_key: str
+    text_encoder_name: str
+    model_max_length: int
+    chi_prompt_str: str
+    prediction_type: str
+    student_timestep: float
+    student_sample_steps: int
+    student_sample_type: str
+    student_t_list: tuple[float, ...] | None
+    state_ch: int
+    tokenizer_config: Any
+
+
+@dataclass(frozen=True)
+class _LightFlowMatching:
+    timescale: float
+
+
+class _LightPiDModel:
+    def __init__(
+        self,
+        *,
+        net: Any,
+        config: _LightPiDConfig,
+        precision: torch.dtype,
+        autocast_dtype: torch.dtype | None,
+        fm_timescale: float,
+        text_encoder: Any = None,
+        vae_encoder: Any = None,
+    ) -> None:
+        self.net = net
+        self.config = config
+        self.precision = precision
+        self.autocast_dtype = autocast_dtype
+        self.fm_trainer = _LightFlowMatching(timescale=float(fm_timescale))
+        self.tokenizer = None
+        self.text_encoder = text_encoder
+        self.vae_encoder = vae_encoder
+        self._num_chi_tokens = 0
+        if self.text_encoder is not None:
+            self._num_chi_tokens = None
+
+    def eval(self):
+        return self
+
+    def _ensure_text_encoder_loaded(self) -> None:
+        if self.tokenizer is not None and self.text_encoder is not None:
+            return
+
+        from pid._src.models.pixeldit_model import _load_text_encoder
+
+        tokenizer, text_encoder = _load_text_encoder(self.config.text_encoder_name, device="cuda")
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
+        self._num_chi_tokens = len(tokenizer.encode(self.config.chi_prompt_str)) if self.config.chi_prompt_str else 0
+
+    @torch.no_grad()
+    def _encode_text_raw(self, captions: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_text_encoder_loaded()
+
+        if self.config.chi_prompt_str:
+            prompts_all = [self.config.chi_prompt_str + cap for cap in captions]
+            max_length_all = self._num_chi_tokens + self.config.model_max_length - 2
+        else:
+            prompts_all = captions
+            max_length_all = self.config.model_max_length
+
+        caption_token = self.tokenizer(
+            prompts_all,
+            max_length=max_length_all,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        ).to("cuda")
+
+        caption_embs = self.text_encoder(caption_token.input_ids, caption_token.attention_mask)[0]
+        select_index = [0] + list(range(-self.config.model_max_length + 1, 0))
+        caption_embs = caption_embs[:, select_index]
+        emb_masks = caption_token.attention_mask[:, select_index]
+        return caption_embs, emb_masks
+
+    def _ensure_vae_encoder_loaded(self) -> None:
+        if self.vae_encoder is not None:
+            return
+        if self.config.tokenizer_config is None:
+            raise RuntimeError("No VAE configured — LQ latent encoding disabled.")
+
+        from pid._ext.imaginaire.lazy_config import instantiate as lazy_instantiate
+
+        self.vae_encoder = lazy_instantiate(self.config.tokenizer_config)
+        if self.config.state_ch > 0 and getattr(self.vae_encoder, "latent_ch", None) != self.config.state_ch:
+            raise ValueError(
+                f"latent_ch {getattr(self.vae_encoder, 'latent_ch', None)} != state_ch {self.config.state_ch}"
+            )
+
+    @torch.no_grad()
+    def encode_lq_latent(self, lq_image: torch.Tensor) -> torch.Tensor:
+        self._ensure_vae_encoder_loaded()
+        if lq_image.ndim == 4:
+            lq_image = lq_image.unsqueeze(2)
+        latent = self.vae_encoder.encode(lq_image)
+        if latent.ndim == 5:
+            latent = latent[:, :, 0, :, :]
+        return latent
+
+    def _net_output_to_x0(
+        self,
+        x_t: torch.Tensor,
+        net_output: torch.Tensor,
+        t: torch.Tensor,
+        prediction_type: str,
+    ) -> torch.Tensor:
+        if prediction_type == "x0":
+            return net_output.to(x_t.dtype)
+        if prediction_type == "velocity":
+            original_dtype = x_t.dtype
+            s = [x_t.shape[0]] + [1] * (x_t.ndim - 1)
+            t_shaped = t.double().view(*s)
+            return (x_t.double() - t_shaped * net_output.double()).to(original_dtype)
+        raise ValueError(f"Invalid prediction_type: {prediction_type}")
+
+    def _net_output_to_velocity(
+        self,
+        x_t: torch.Tensor,
+        net_output: torch.Tensor,
+        t: torch.Tensor,
+        prediction_type: str,
+    ) -> torch.Tensor:
+        if prediction_type == "velocity":
+            return net_output
+        if prediction_type == "x0":
+            original_dtype = x_t.dtype
+            s = [x_t.shape[0]] + [1] * (x_t.ndim - 1)
+            t_shaped = t.double().view(*s).clamp(min=5e-2)
+            return ((x_t.double() - net_output.double()) / t_shaped).to(original_dtype)
+        raise ValueError(f"Invalid prediction_type: {prediction_type}")
+
+    def _velocity_to_x0(self, x_t: torch.Tensor, net_output: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self._net_output_to_x0(x_t, net_output, t, self.config.prediction_type)
+
+    def _get_t_list(self, device, num_steps: int | None = None) -> torch.Tensor:
+        target_steps = num_steps if num_steps is not None else self.config.student_sample_steps
+        if self.config.student_t_list is not None:
+            full_t = torch.tensor(self.config.student_t_list, device=device, dtype=torch.float32)
+            if target_steps != self.config.student_sample_steps:
+                indices = torch.linspace(0, len(full_t) - 1, target_steps + 1, device=device).round().long()
+                t_list = full_t[indices]
+            else:
+                t_list = full_t
+        else:
+            t_list = torch.linspace(
+                self.config.student_timestep,
+                0.0,
+                target_steps + 1,
+                device=device,
+                dtype=torch.float32,
+            )
+        if abs(t_list[-1].item()) >= 1e-6:
+            raise ValueError("t_list must end at 0")
+        return t_list
+
+
 @dataclass
 class _DecodeProgress:
     total: int
@@ -210,6 +374,10 @@ def _offload_aux_modules(model: Any) -> None:
     _empty_cuda_cache()
 
 
+def _get_execution_dtype(model: Any) -> torch.dtype:
+    return getattr(model, "autocast_dtype", None) or getattr(model, "precision", torch.float32)
+
+
 def _set_runtime_net_device(model: Any, device: str, precision: torch.dtype | None = None) -> None:
     net = getattr(model, "net", None)
     if net is None:
@@ -230,7 +398,7 @@ def _set_runtime_net_device(model: Any, device: str, precision: torch.dtype | No
 
 
 def _prepare_model_for_inference(model: Any) -> None:
-    precision = getattr(model, "precision", torch.float32)
+    precision = _get_execution_dtype(model)
     _set_runtime_net_device(model, "cuda", precision=precision)
     if getattr(model, "text_encoder", None) is not None:
         _set_module_eval(model.text_encoder)
@@ -248,6 +416,59 @@ def _clear_prompt_cache(prefix: tuple[str, str] | None = None) -> None:
         return
     for key in [key for key in _PROMPT_CACHE if key[:2] == prefix]:
         _PROMPT_CACHE.pop(key, None)
+
+
+def _to_light_model(model: Any) -> _LightPiDModel:
+    config = getattr(model, "config", None)
+    if config is None:
+        raise RuntimeError("PiD runtime invalido: modelo carregado sem config.")
+
+    light_config = _LightPiDConfig(
+        input_caption_key=str(config.input_caption_key),
+        text_encoder_name=str(config.text_encoder_name),
+        model_max_length=int(config.model_max_length),
+        chi_prompt_str="\n".join(config.chi_prompt) if getattr(config, "chi_prompt", None) else "",
+        prediction_type=str(getattr(config, "prediction_type", "velocity")),
+        student_timestep=float(getattr(config, "student_timestep", 1.0)),
+        student_sample_steps=int(getattr(config, "student_sample_steps", 1)),
+        student_sample_type=str(getattr(config, "student_sample_type", "sde")),
+        student_t_list=tuple(float(v) for v in config.student_t_list) if getattr(config, "student_t_list", None) else None,
+        state_ch=int(getattr(config, "state_ch", 0)),
+        tokenizer_config=getattr(config, "tokenizer", None),
+    )
+
+    net = getattr(model, "net", None)
+    if net is None:
+        raise RuntimeError("PiD runtime invalido: modelo carregado sem net.")
+
+    text_encoder = getattr(model, "text_encoder", None)
+    vae_encoder = getattr(model, "vae_encoder", None)
+
+    try:
+        model.net = None
+    except Exception:
+        pass
+    try:
+        model.text_encoder = None
+    except Exception:
+        pass
+    try:
+        model.vae_encoder = None
+    except Exception:
+        pass
+
+    light_model = _LightPiDModel(
+        net=net,
+        config=light_config,
+        precision=getattr(model, "precision", torch.float32),
+        autocast_dtype=getattr(model, "autocast_dtype", None),
+        fm_timescale=float(getattr(getattr(model, "fm_trainer", None), "timescale", 1000.0)),
+        text_encoder=text_encoder,
+        vae_encoder=vae_encoder,
+    )
+    del model
+    gc.collect()
+    return light_model
 
 
 def _release_active_runtime() -> None:
@@ -301,6 +522,7 @@ def _load_runtime(backbone: str, ckpt_type: str) -> tuple[PiDHandle, Any]:
             strict=False,
         )
 
+    model = _to_light_model(model)
     _prepare_model_for_inference(model)
     handle = PiDHandle(
         backbone=backbone,
@@ -347,10 +569,11 @@ def _encode_prompt_once(handle: PiDHandle, prompt: str) -> PiDPrompt:
         return cached
 
     model = _get_model(handle)
+    if hasattr(model, "_ensure_text_encoder_loaded"):
+        model._ensure_text_encoder_loaded()
     text_encoder = getattr(model, "text_encoder", None)
     if text_encoder is None:
         raise RuntimeError("O modelo PiD carregado nao possui text_encoder.")
-
     _set_module_device(text_encoder, handle.device)
     with torch.inference_mode():
         caption_embs, attention_mask = model._encode_text_raw([prompt])
@@ -461,6 +684,37 @@ def _autocorrect_encode_image_tensor(handle: PiDHandle, image_tensor: torch.Tens
     chw_image = image_tensor.permute(0, 3, 1, 2).contiguous()
     resized = _resize_spatial_tensor(chw_image, (target_height, target_width), "bilinear")
     return resized.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
+
+
+def _get_preview_size() -> int:
+    try:
+        from comfy.cli_args import args
+
+        return int(getattr(args, "preview_size", 512))
+    except Exception:
+        return 512
+
+
+def _make_preview_tuple(image: torch.Tensor):
+    preview_size = _get_preview_size()
+    preview_tensor = image[:1].float().clamp(0, 1)
+    if preview_size > 0:
+        height = int(preview_tensor.shape[-2])
+        width = int(preview_tensor.shape[-1])
+        scale = min(preview_size / max(height, 1), preview_size / max(width, 1), 1.0)
+        if scale < 1.0:
+            target_height = max(1, int(round(height * scale)))
+            target_width = max(1, int(round(width * scale)))
+            preview_tensor = F.interpolate(
+                preview_tensor,
+                size=(target_height, target_width),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+
+    arr = (preview_tensor[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype("uint8")
+    return ("JPEG", Image.fromarray(arr), preview_size)
 
 
 def encode_image_to_latent(handle: PiDHandle, image: Any) -> dict[str, torch.Tensor]:
@@ -676,7 +930,7 @@ def _decode_samples(
     output_w = baseline_w * handle.pid_scale
     batch_size = int(latent_tensor.shape[0])
 
-    precision = getattr(model, "precision", torch.float32)
+    precision = _get_execution_dtype(model)
     _set_runtime_net_device(model, device, precision=precision)
     caption_embs = pid_prompt.caption_embs
     if caption_embs.ndim != 3:
@@ -708,17 +962,7 @@ def _decode_samples(
         if not preview_enabled:
             return None
         image = (x0[:1].float().clamp(-1, 1) * 0.5 + 0.5).clamp(0, 1)
-        arr = (image[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype("uint8")
-        preview = Image.fromarray(arr)
-        try:
-            from comfy.cli_args import args
-
-            preview_size = int(getattr(args, "preview_size", 512))
-        except Exception:
-            preview_size = 512
-        if preview_size > 0:
-            preview.thumbnail((preview_size, preview_size))
-        return ("JPEG", preview, preview_size)
+        return _make_preview_tuple(image)
 
     with torch.inference_mode():
         effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else int(model.config.student_sample_steps)
@@ -924,7 +1168,7 @@ def decode_latent_tiled(
     effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else 4
     progress = _DecodeProgress(total=max(1, tile_count * max(1, effective_steps)), node_id=unique_id)
     model = _get_model(handle)
-    precision = getattr(model, "precision", torch.float32)
+    precision = _get_execution_dtype(model)
     full_noise = _make_decode_noise(batch_size, output_h, output_w, handle.device, seed, dtype=precision)
 
     index = 0
@@ -999,14 +1243,7 @@ def decode_latent_tiled(
         composed = output / weight_sum.clamp_min(1e-6)
         preview = None
         try:
-            arr = (composed[0].clamp(0, 1).cpu().numpy() * 255.0).astype("uint8")
-            preview_image = Image.fromarray(arr)
-            from comfy.cli_args import args
-
-            preview_size = int(getattr(args, "preview_size", 512))
-            if preview_size > 0:
-                preview_image.thumbnail((preview_size, preview_size))
-            preview = ("JPEG", preview_image, preview_size)
+            preview = _make_preview_tuple(composed.permute(0, 3, 1, 2))
         except Exception:
             preview = None
         progress.update(advance=0, preview=preview)
