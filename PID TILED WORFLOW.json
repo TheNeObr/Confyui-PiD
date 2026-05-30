@@ -1,7 +1,7 @@
 {
   "id": "fd4b8fe7-699f-46c0-89e1-a34f72e987b5",
   "revision": 0,
-  "last_node_id": 31,
+  "last_node_id": 32,
   "last_link_id": 51,
   "nodes": [
     {
@@ -292,53 +292,6 @@
       ]
     },
     {
-      "id": 22,
-      "type": "PiDEncodeImage",
-      "pos": [
-        400,
-        60
-      ],
-      "size": [
-        210,
-        80
-      ],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "pid_model",
-          "type": "PID_MODEL",
-          "link": 37
-        },
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": 38
-        }
-      ],
-      "outputs": [
-        {
-          "name": "latent",
-          "type": "LATENT",
-          "links": [
-            50
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "PiDEncodeImage",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.8"
-        }
-      },
-      "widgets_values": [
-        "512"
-      ]
-    },
-    {
       "id": 1,
       "type": "LoadImage",
       "pos": [
@@ -547,6 +500,53 @@
         }
       },
       "widgets_values": []
+    },
+    {
+      "id": 22,
+      "type": "PiDEncodeImage",
+      "pos": [
+        400,
+        60
+      ],
+      "size": [
+        210,
+        80
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "pid_model",
+          "type": "PID_MODEL",
+          "link": 37
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 38
+        }
+      ],
+      "outputs": [
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            50
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PiDEncodeImage",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.8"
+        }
+      },
+      "widgets_values": [
+        "disabled"
+      ]
     }
   ],
   "links": [
