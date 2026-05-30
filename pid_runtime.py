@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import os
 import sys
+import time
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -17,13 +18,20 @@ NODE_ROOT = Path(__file__).resolve().parent
 UPSTREAM_ROOT = NODE_ROOT / "upstream-pid"
 UPSTREAM_CONFIG = "pid/_src/configs/pid/config.py"
 HF_REPO_ID = "nvidia/PiD"
+HF_PID_TEXT_ENCODER_REPO_ID = "Comfy-Org/Lumina_Image_2.0_Repackaged"
+HF_PID_TEXT_ENCODER_FILE = "split_files/text_encoders/gemma_2_2b_fp16.safetensors"
+HF_PID_TEXT_ENCODER_TOKENIZER_REPO_ID = "Efficient-Large-Model/gemma-2-2b-it"
+HF_PID_TEXT_ENCODER_TOKENIZER_FILE = "tokenizer.model"
 
 SUPPORTED_BACKBONES = ("flux", "sd3", "flux2")
 SUPPORTED_VARIANTS = ("2k", "2kto4k")
 SUPPORTED_LATENT_INTERPOLATIONS = ("nearest-exact", "bilinear", "bicubic", "area")
 LATENT_CHANNELS = {"flux": 16, "sd3": 16, "flux2": 128}
 LATENT_COMPRESSION = {"flux": 8, "sd3": 8, "flux2": 16}
+PID_TEXT_EMBED_DIM = 2304
+PID_TEXT_TOKEN_COUNT = 300
 MAX_PROMPT_CACHE_ITEMS = 8
+AUTOENCODE_TILE_OVERLAP = {"flux": 128, "sd3": 128, "flux2": 128}
 # Tiles muito pequenos tendem a colapsar a cor no PiD; decodificamos com contexto maior
 # e recortamos o centro para manter a saida pedida sem o desvio verde.
 MIN_TILED_DECODE_SIZE = 512
@@ -31,6 +39,7 @@ MIN_TILED_DECODE_SIZE = 512
 _HANDLE_CACHE: dict[tuple[str, str], "PiDHandle"] = {}
 _PROMPT_CACHE: "OrderedDict[tuple[str, str, str], PiDPrompt]" = OrderedDict()
 _ACTIVE_RUNTIME: "_PiDLoadedRuntime | None" = None
+_VAE_ONLY_CACHE: dict[tuple[str, str], Any] = {}
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,7 @@ class _PiDLoadedRuntime:
 
 @dataclass(frozen=True)
 class _LightPiDConfig:
+    backbone: str
     input_caption_key: str
     text_encoder_name: str
     model_max_length: int
@@ -109,6 +119,15 @@ class _LightPiDModel:
         if self.tokenizer is not None and self.text_encoder is not None:
             return
 
+        try:
+            text_encoder = _load_native_text_encoder(self.config.text_encoder_name)
+            self.tokenizer = getattr(text_encoder, "tokenizer", None)
+            self.text_encoder = text_encoder
+            self._num_chi_tokens = 0
+            return
+        except Exception:
+            pass
+
         from pid._src.models.pixeldit_model import _load_text_encoder
 
         tokenizer, text_encoder = _load_text_encoder(self.config.text_encoder_name, device="cuda")
@@ -119,6 +138,28 @@ class _LightPiDModel:
     @torch.no_grad()
     def _encode_text_raw(self, captions: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         self._ensure_text_encoder_loaded()
+
+        if _is_comfy_clip_text_encoder(self.text_encoder):
+            import comfy.model_management
+
+            comfy.model_management.load_models_gpu([self.text_encoder.patcher], force_full_load=True)
+            caption_embs_all = []
+            attention_masks_all = []
+            for caption in captions:
+                encoded = self.text_encoder.encode_from_tokens(
+                    self.text_encoder.tokenize(caption),
+                    return_dict=True,
+                )
+                caption_embs_all.append(encoded["cond"])
+                attention_mask = encoded.get("attention_mask")
+                if attention_mask is None:
+                    attention_mask = torch.ones(
+                        encoded["cond"].shape[:2],
+                        dtype=torch.int64,
+                        device=encoded["cond"].device,
+                    )
+                attention_masks_all.append(attention_mask.to(dtype=torch.int64))
+            return torch.cat(caption_embs_all, dim=0), torch.cat(attention_masks_all, dim=0)
 
         if self.config.chi_prompt_str:
             prompts_all = [self.config.chi_prompt_str + cap for cap in captions]
@@ -144,12 +185,7 @@ class _LightPiDModel:
     def _ensure_vae_encoder_loaded(self) -> None:
         if self.vae_encoder is not None:
             return
-        if self.config.tokenizer_config is None:
-            raise RuntimeError("No VAE configured — LQ latent encoding disabled.")
-
-        from pid._ext.imaginaire.lazy_config import instantiate as lazy_instantiate
-
-        self.vae_encoder = lazy_instantiate(self.config.tokenizer_config)
+        self.vae_encoder = _instantiate_vae_encoder(self.config.backbone, self.config.tokenizer_config)
         if self.config.state_ch > 0 and getattr(self.vae_encoder, "latent_ch", None) != self.config.state_ch:
             raise ValueError(
                 f"latent_ch {getattr(self.vae_encoder, 'latent_ch', None)} != state_ch {self.config.state_ch}"
@@ -222,6 +258,65 @@ class _LightPiDModel:
         return t_list
 
 
+class _NativePiDModel(_LightPiDModel):
+    def __init__(
+        self,
+        *,
+        patcher: Any,
+        base_model: Any,
+        config: _LightPiDConfig,
+        text_encoder: Any = None,
+        vae_encoder: Any = None,
+    ) -> None:
+        inference_dtype = base_model.get_dtype_inference()
+        super().__init__(
+            net=base_model.diffusion_model,
+            config=config,
+            precision=inference_dtype,
+            autocast_dtype=inference_dtype if inference_dtype in (torch.float16, torch.bfloat16) else None,
+            fm_timescale=1000.0,
+            text_encoder=text_encoder,
+            vae_encoder=vae_encoder,
+        )
+        self.patcher = patcher
+        self.base_model = base_model
+
+    def ensure_model_loaded(self) -> None:
+        import comfy.model_management
+
+        comfy.model_management.load_models_gpu([self.patcher], force_full_load=True)
+        self.patcher.pre_run()
+        self.net = self.base_model.diffusion_model
+
+    def release_native_model(self) -> None:
+        import comfy.model_management
+
+        comfy.model_management.unload_model_and_clones(self.patcher)
+
+    def predict_x0(
+        self,
+        x: torch.Tensor,
+        sigma: torch.Tensor,
+        caption_embs: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        lq_latent: torch.Tensor,
+        degrade_sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        t_scaled = sigma * self.fm_trainer.timescale
+        autocast_ctx = torch.autocast("cuda", dtype=self.autocast_dtype) if self.autocast_dtype else nullcontext()
+        with autocast_ctx:
+            net_output = self.net(
+                x,
+                t_scaled,
+                context=caption_embs,
+                attention_mask=attention_mask,
+                lq_latent=lq_latent,
+                degrade_sigma=degrade_sigma,
+                transformer_options={},
+            )
+        return self._velocity_to_x0(x, net_output, sigma)
+
+
 @dataclass
 class _DecodeProgress:
     total: int
@@ -229,18 +324,91 @@ class _DecodeProgress:
     current: int = 0
 
     def __post_init__(self):
+        self.total = max(1, int(self.total))
+        self._started_at = time.perf_counter()
+        self._last_cli_render_at = 0.0
+        self._cli_finished = False
+        self._cli_min_interval = 0.1
+        self._stream = getattr(sys, "stderr", None)
         try:
             from comfy.utils import ProgressBar
 
-            self._bar = ProgressBar(max(1, int(self.total)), node_id=self.node_id)
+            self._bar = ProgressBar(self.total, node_id=self.node_id)
             self._bar.update_absolute(0, self.total)
         except Exception:
             self._bar = None
+        self._render_cli(force=True)
 
-    def update(self, advance: int = 1, preview=None) -> None:
+    def _render_cli(self, force: bool = False) -> None:
+        if self._cli_finished:
+            return
+        stream = self._stream
+        if stream is None or not hasattr(stream, "write"):
+            return
+
+        now = time.perf_counter()
+        is_final = self.current >= self.total
+        if not force and not is_final and (now - self._last_cli_render_at) < self._cli_min_interval:
+            return
+
+        elapsed = max(now - self._started_at, 1e-6)
+        iterations_per_second = self.current / elapsed if self.current > 0 else 0.0
+        remaining_steps = max(0, self.total - self.current)
+        eta_seconds = (remaining_steps / iterations_per_second) if iterations_per_second > 1e-6 else None
+        progress_ratio = min(1.0, self.current / max(1, self.total))
+        filled = min(24, int(round(progress_ratio * 24)))
+        bar = "#" * filled + "-" * (24 - filled)
+        if eta_seconds is None:
+            eta_text = "--:--"
+        else:
+            eta_total_seconds = max(0, int(round(eta_seconds)))
+            eta_minutes, eta_secs = divmod(eta_total_seconds, 60)
+            eta_hours, eta_minutes = divmod(eta_minutes, 60)
+            eta_text = (
+                f"{eta_hours:02d}:{eta_minutes:02d}:{eta_secs:02d}"
+                if eta_hours > 0
+                else f"{eta_minutes:02d}:{eta_secs:02d}"
+            )
+        line = (
+            f"\rPiD KSampler [{bar}] "
+            f"{self.current}/{self.total} steps "
+            f"({progress_ratio * 100:5.1f}%) "
+            f"{iterations_per_second:5.2f} it/s "
+            f"ETA {eta_text}"
+        )
+        stream.write(line)
+        if hasattr(stream, "flush"):
+            stream.flush()
+        self._last_cli_render_at = now
+
+        if is_final:
+            stream.write("\n")
+            if hasattr(stream, "flush"):
+                stream.flush()
+            self._cli_finished = True
+
+    def _send_legacy_preview(self, preview) -> None:
+        if preview is None:
+            return
+        try:
+            from protocol import BinaryEventTypes
+            from server import PromptServer
+
+            server_instance = getattr(PromptServer, "instance", None)
+            if server_instance is None:
+                return
+            client_id = getattr(server_instance, "client_id", None)
+            server_instance.send_sync(BinaryEventTypes.UNENCODED_PREVIEW_IMAGE, preview, client_id)
+        except Exception:
+            pass
+
+    def update(self, advance: int = 1, preview=None, emit_bar: bool = True) -> None:
         self.current = min(self.total, self.current + int(advance))
-        if self._bar is not None:
+        self._render_cli(force=emit_bar or self.current >= self.total)
+        if emit_bar and self._bar is not None:
             self._bar.update_absolute(self.current, self.total, preview)
+        if emit_bar and preview is not None:
+            self._send_legacy_preview(preview)
 
 
 @dataclass(frozen=True)
@@ -323,6 +491,276 @@ def _tokenizer_overrides(backbone: str) -> list[str]:
     return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
 
 
+def _native_chi_prompt() -> str:
+    try:
+        from comfy.text_encoders import pixeldit as comfy_pixeldit
+
+        return getattr(comfy_pixeldit, "_PIXELDIT_CHI_PROMPT")
+    except Exception:
+        return (
+            'Given a user prompt, generate an "Enhanced prompt" that provides detailed visual descriptions '
+            "suitable for image generation. Evaluate the level of detail in the user prompt:\n"
+            "- If the prompt is simple, focus on adding specifics about colors, shapes, sizes, textures, and spatial relationships to create vivid and concrete scenes.\n"
+            "- If the prompt is already detailed, refine and enhance the existing details slightly without overcomplicating.\n"
+            "Here are examples of how to transform or refine prompts:\n"
+            "- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat curled up in a round shape, sleeping peacefully on a warm sunny windowsill, surrounded by pots of blooming red flowers.\n"
+            "- User Prompt: A busy city street -> Enhanced: A bustling city street scene at dusk, featuring glowing street lamps, a diverse crowd of people in colorful clothing, and a double-decker bus passing by towering glass skyscrapers.\n"
+            "Please generate only the enhanced description for the prompt below and avoid including any additional commentary or evaluations:\n"
+            "User Prompt: "
+        )
+
+
+def _native_pid_config(backbone: str) -> _LightPiDConfig:
+    return _LightPiDConfig(
+        backbone=backbone,
+        input_caption_key="caption",
+        text_encoder_name="gemma-2-2b-it",
+        model_max_length=300,
+        chi_prompt_str=_native_chi_prompt(),
+        prediction_type="velocity",
+        student_timestep=1.0,
+        student_sample_steps=4,
+        student_sample_type="sde",
+        student_t_list=(0.999, 0.866, 0.634, 0.342, 0.0),
+        state_ch=LATENT_CHANNELS[backbone],
+        tokenizer_config=None,
+    )
+
+
+def _instantiate_vae_encoder(backbone: str, tokenizer_config: Any = None) -> Any:
+    if tokenizer_config is not None:
+        from pid._ext.imaginaire.lazy_config import instantiate as lazy_instantiate
+
+        return lazy_instantiate(tokenizer_config)
+
+    if backbone == "flux":
+        from pid._src.tokenizers.flux_vae import FluxVAEInterface
+
+        return FluxVAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "ae.safetensors").as_posix())
+    if backbone == "sd3":
+        from pid._src.tokenizers.flux_vae import SD3VAEInterface
+
+        return SD3VAEInterface(
+            vae_pth=(UPSTREAM_ROOT / "checkpoints" / "sd3_vae" / "vae" / "diffusion_pytorch_model.safetensors").as_posix()
+        )
+    if backbone == "flux2":
+        from pid._src.tokenizers.flux2_vae import Flux2VAEInterface
+
+        return Flux2VAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "flux2_ae.safetensors").as_posix())
+    raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
+
+
+def _patch_native_pid_attention_dtype_mismatch() -> None:
+    try:
+        import comfy.ldm.pixeldit.model as comfy_pixeldit_model
+        import comfy.ldm.pixeldit.modules as comfy_pixeldit_modules
+    except Exception:
+        return
+
+    joint_attn_cls = getattr(comfy_pixeldit_model, "MMDiTJointAttention", None)
+    if joint_attn_cls is not None and not getattr(joint_attn_cls, "_pidnode_dtype_patch", False):
+        def patched_joint_forward(self, x, y, pos_img, pos_txt=None, attn_mask=None, transformer_options={}):
+            batch_size, image_tokens, _ = x.shape
+            _, text_tokens, _ = y.shape
+            num_heads = self.num_heads
+            head_dim = self.head_dim
+
+            qkv_x = self.qkv_x(x).reshape(batch_size, image_tokens, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+            qx, kx, vx = qkv_x.unbind(0)
+            qx = self.q_norm_x(qx)
+            kx = self.k_norm_x(kx)
+
+            qkv_y = self.qkv_y(y).reshape(batch_size, text_tokens, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+            qy, ky, vy = qkv_y.unbind(0)
+            qy = self.q_norm_y(qy)
+            ky = self.k_norm_y(ky)
+
+            qx, kx = comfy_pixeldit_model.apply_rope(qx, kx, pos_img[None, None])
+            if pos_txt is not None:
+                qy, ky = comfy_pixeldit_model.apply_rope(qy, ky, pos_txt[None, None])
+
+            q_joint = torch.cat([qy, qx], dim=2)
+            k_joint = torch.cat([ky, kx], dim=2)
+            v_joint = torch.cat([vy, vx], dim=2)
+            target_dtype = v_joint.dtype
+            if q_joint.dtype != target_dtype:
+                q_joint = q_joint.to(dtype=target_dtype)
+            if k_joint.dtype != target_dtype:
+                k_joint = k_joint.to(dtype=target_dtype)
+
+            out_joint = comfy_pixeldit_model.optimized_attention(
+                q_joint,
+                k_joint,
+                v_joint,
+                num_heads,
+                mask=attn_mask,
+                skip_reshape=True,
+                skip_output_reshape=True,
+                transformer_options=transformer_options,
+            )
+
+            out_y = out_joint[:, :, :text_tokens, :].transpose(1, 2).reshape(batch_size, text_tokens, num_heads * head_dim)
+            out_x = out_joint[:, :, text_tokens:, :].transpose(1, 2).reshape(batch_size, image_tokens, num_heads * head_dim)
+            return self.proj_x(out_x), self.proj_y(out_y)
+
+        joint_attn_cls.forward = patched_joint_forward
+        joint_attn_cls._pidnode_dtype_patch = True
+
+    rotary_attn_cls = getattr(comfy_pixeldit_modules, "RotaryAttention", None)
+    if rotary_attn_cls is not None and not getattr(rotary_attn_cls, "_pidnode_dtype_patch", False):
+        def patched_rotary_forward(self, x, pos, mask=None, transformer_options={}):
+            batch_size, token_count, channels = x.shape
+            num_heads = self.num_heads
+            head_dim = self.head_dim
+            qkv = self.qkv(x).reshape(batch_size, token_count, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+            q, k = comfy_pixeldit_modules.apply_rope(self.q_norm(q), self.k_norm(k), pos[None, None])
+            target_dtype = v.dtype
+            if q.dtype != target_dtype:
+                q = q.to(dtype=target_dtype)
+            if k.dtype != target_dtype:
+                k = k.to(dtype=target_dtype)
+            out = comfy_pixeldit_modules.optimized_attention(
+                q,
+                k,
+                v,
+                num_heads,
+                mask=mask,
+                skip_reshape=True,
+                transformer_options=transformer_options,
+            )
+            return self.proj(out)
+
+        rotary_attn_cls.forward = patched_rotary_forward
+        rotary_attn_cls._pidnode_dtype_patch = True
+
+
+def _native_lq_latent_process_in(backbone: str, latent: torch.Tensor) -> torch.Tensor:
+    import comfy.latent_formats
+
+    if backbone == "flux":
+        return comfy.latent_formats.Flux().process_in(latent)
+    if backbone == "sd3":
+        return comfy.latent_formats.SD3().process_in(latent)
+    if backbone == "flux2":
+        return comfy.latent_formats.Flux2().process_in(latent)
+    raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
+
+
+def _is_comfy_clip_text_encoder(text_encoder: Any) -> bool:
+    if text_encoder is None:
+        return False
+    cls = text_encoder.__class__
+    return getattr(cls, "__module__", "") == "comfy.sd" and getattr(cls, "__name__", "") == "CLIP"
+
+
+def _native_text_encoder_dir(name: str) -> Path:
+    if name != "gemma-2-2b-it":
+        raise ValueError(f"Unsupported native PiD text encoder: {name!r}")
+    return UPSTREAM_ROOT / "checkpoints" / "text_encoders" / name
+
+
+def _find_native_text_encoder_files(name: str) -> tuple[list[Path], Path]:
+    text_encoder_dir = _native_text_encoder_dir(name)
+    shard_paths = sorted(text_encoder_dir.rglob("*.safetensors"))
+    if not shard_paths:
+        raise FileNotFoundError(f"Nenhum shard safetensors encontrado para o text encoder PiD em {text_encoder_dir}.")
+
+    tokenizer_candidates = sorted(text_encoder_dir.rglob("tokenizer.model"))
+    if not tokenizer_candidates:
+        raise FileNotFoundError(f"tokenizer.model nao encontrado para o text encoder PiD em {text_encoder_dir}.")
+    return shard_paths, tokenizer_candidates[0]
+
+
+def _ensure_native_text_encoder_assets(name: str) -> Path:
+    text_encoder_dir = _native_text_encoder_dir(name)
+    text_encoder_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _find_native_text_encoder_files(name)
+        return text_encoder_dir
+    except FileNotFoundError:
+        pass
+
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        repo_id=HF_PID_TEXT_ENCODER_REPO_ID,
+        local_dir=str(text_encoder_dir),
+        allow_patterns=[HF_PID_TEXT_ENCODER_FILE],
+    )
+    snapshot_download(
+        repo_id=HF_PID_TEXT_ENCODER_TOKENIZER_REPO_ID,
+        local_dir=str(text_encoder_dir),
+        allow_patterns=[HF_PID_TEXT_ENCODER_TOKENIZER_FILE],
+    )
+
+    _find_native_text_encoder_files(name)
+    return text_encoder_dir
+
+
+def _load_native_text_encoder(name: str) -> Any:
+    import comfy.sd
+    import comfy.utils
+    _ensure_native_text_encoder_assets(name)
+    shard_paths, tokenizer_model = _find_native_text_encoder_files(name)
+
+    state_dict = {}
+    for shard_path in shard_paths:
+        state_dict.update(comfy.utils.load_torch_file(str(shard_path), safe_load=True))
+
+    state_dict["spiece_model"] = tokenizer_model.read_bytes()
+
+    return comfy.sd.load_text_encoder_state_dicts(
+        [state_dict],
+        clip_type=comfy.sd.CLIPType.PIXELDIT,
+        model_options={},
+    )
+
+
+def _validate_pid_prompt_tensors(
+    caption_embs: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    *,
+    prompt_source: str,
+) -> None:
+    if caption_embs.ndim != 3:
+        raise ValueError(f"caption_embs invalido para PiD: {tuple(caption_embs.shape)}.")
+    if int(caption_embs.shape[1]) != PID_TEXT_TOKEN_COUNT or int(caption_embs.shape[2]) != PID_TEXT_EMBED_DIM:
+        raise ValueError(
+            f"{prompt_source} gerou embeddings {tuple(caption_embs.shape)}; o PiD espera [B,{PID_TEXT_TOKEN_COUNT},{PID_TEXT_EMBED_DIM}]. "
+            "Use o text encoder Gemma do PiD ou um CLIP carregado com type='pixeldit'."
+        )
+    if attention_mask is not None and tuple(attention_mask.shape) != tuple(caption_embs.shape[:2]):
+        raise ValueError(
+            f"attention_mask invalida para PiD: esperado {tuple(caption_embs.shape[:2])}, recebeu {tuple(attention_mask.shape)}."
+        )
+
+
+def _encode_prompt_with_external_clip(clip: Any, prompt: str) -> PiDPrompt:
+    if not _is_comfy_clip_text_encoder(clip):
+        raise ValueError("O input clip do PiD precisa ser um objeto CLIP do ComfyUI.")
+
+    import comfy.model_management
+
+    comfy.model_management.load_models_gpu([clip.patcher], force_full_load=True)
+    with torch.inference_mode():
+        encoded = clip.encode_from_tokens(
+            clip.tokenize(prompt),
+            return_dict=True,
+        )
+    caption_embs = encoded["cond"]
+    attention_mask = encoded.get("attention_mask")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(dtype=torch.int64)
+    _validate_pid_prompt_tensors(caption_embs, attention_mask, prompt_source="O CLIP externo")
+    return PiDPrompt(
+        caption_embs=caption_embs.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+        attention_mask=attention_mask.detach().to(device="cpu", dtype=torch.int64).contiguous() if attention_mask is not None else None,
+        prompt=prompt,
+    )
+
+
 def _ensure_assets(backbone: str, ckpt_type: str) -> None:
     patterns = _asset_patterns(backbone, ckpt_type)
     missing = [pattern for pattern in patterns if not list(UPSTREAM_ROOT.glob(pattern))]
@@ -336,6 +774,38 @@ def _ensure_assets(backbone: str, ckpt_type: str) -> None:
         local_dir=str(UPSTREAM_ROOT),
         allow_patterns=patterns,
     )
+
+
+def _prepare_handle(backbone: str, ckpt_type: str) -> PiDHandle:
+    if backbone not in SUPPORTED_BACKBONES:
+        raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
+    if ckpt_type not in SUPPORTED_VARIANTS:
+        raise ValueError(f"Unsupported PiD variant: {ckpt_type!r}")
+
+    cache_key = (backbone, ckpt_type)
+    cached_handle = _HANDLE_CACHE.get(cache_key)
+    if cached_handle is not None:
+        return cached_handle
+
+    _ensure_upstream_path()
+    _ensure_assets(backbone, ckpt_type)
+
+    from pid._src.inference.checkpoint_registry import get_pid_checkpoint
+
+    pid_checkpoint = get_pid_checkpoint(backbone, ckpt_type)
+    checkpoint_path = (UPSTREAM_ROOT / pid_checkpoint.checkpoint_path).resolve()
+    handle = PiDHandle(
+        backbone=backbone,
+        ckpt_type=ckpt_type,
+        pid_scale=4,
+        latent_channels=LATENT_CHANNELS[backbone],
+        latent_compression=LATENT_COMPRESSION[backbone],
+        input_caption_key="caption",
+        checkpoint_path=str(checkpoint_path),
+        device="cuda",
+    )
+    _HANDLE_CACHE[cache_key] = handle
+    return handle
 
 
 def _empty_cuda_cache() -> None:
@@ -369,7 +839,16 @@ def _disable_module_grads(module: Any) -> None:
 
 
 def _offload_aux_modules(model: Any) -> None:
-    _set_module_device(getattr(model, "text_encoder", None), "cpu")
+    text_encoder = getattr(model, "text_encoder", None)
+    if _is_comfy_clip_text_encoder(text_encoder):
+        try:
+            import comfy.model_management
+
+            comfy.model_management.unload_model_and_clones(text_encoder.patcher)
+        except Exception:
+            pass
+    else:
+        _set_module_device(text_encoder, "cpu")
     _set_module_device(getattr(model, "vae_encoder", None), "cpu")
     _empty_cuda_cache()
 
@@ -398,8 +877,9 @@ def _set_runtime_net_device(model: Any, device: str, precision: torch.dtype | No
 
 
 def _prepare_model_for_inference(model: Any) -> None:
-    precision = _get_execution_dtype(model)
-    _set_runtime_net_device(model, "cuda", precision=precision)
+    if not hasattr(model, "patcher"):
+        precision = _get_execution_dtype(model)
+        _set_runtime_net_device(model, "cuda", precision=precision)
     if getattr(model, "text_encoder", None) is not None:
         _set_module_eval(model.text_encoder)
         _disable_module_grads(model.text_encoder)
@@ -418,12 +898,13 @@ def _clear_prompt_cache(prefix: tuple[str, str] | None = None) -> None:
         _PROMPT_CACHE.pop(key, None)
 
 
-def _to_light_model(model: Any) -> _LightPiDModel:
+def _to_light_model(model: Any, backbone: str) -> _LightPiDModel:
     config = getattr(model, "config", None)
     if config is None:
         raise RuntimeError("PiD runtime invalido: modelo carregado sem config.")
 
     light_config = _LightPiDConfig(
+        backbone=backbone,
         input_caption_key=str(config.input_caption_key),
         text_encoder_name=str(config.text_encoder_name),
         model_max_length=int(config.model_max_length),
@@ -471,6 +952,21 @@ def _to_light_model(model: Any) -> _LightPiDModel:
     return light_model
 
 
+def _load_native_model(backbone: str, checkpoint_path: Path) -> _NativePiDModel:
+    import comfy.sd
+
+    _patch_native_pid_attention_dtype_mismatch()
+    patcher = comfy.sd.load_diffusion_model(str(checkpoint_path), model_options={})
+    base_model = patcher.model
+    if base_model is None or getattr(base_model, "diffusion_model", None) is None:
+        raise RuntimeError(f"Falha ao carregar runtime nativo PiD para {backbone}.")
+    return _NativePiDModel(
+        patcher=patcher,
+        base_model=base_model,
+        config=_native_pid_config(backbone),
+    )
+
+
 def _release_active_runtime() -> None:
     global _ACTIVE_RUNTIME
 
@@ -479,6 +975,11 @@ def _release_active_runtime() -> None:
         return
 
     model = runtime.model
+    if hasattr(model, "release_native_model"):
+        try:
+            model.release_native_model()
+        except Exception:
+            pass
     for module_name in ("net", "text_encoder", "vae_encoder"):
         _set_module_device(getattr(model, module_name, None), "cpu")
 
@@ -492,26 +993,21 @@ def _release_active_runtime() -> None:
 def _load_runtime(backbone: str, ckpt_type: str) -> tuple[PiDHandle, Any]:
     global _ACTIVE_RUNTIME
 
-    if backbone not in SUPPORTED_BACKBONES:
-        raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
-    if ckpt_type not in SUPPORTED_VARIANTS:
-        raise ValueError(f"Unsupported PiD variant: {ckpt_type!r}")
     if not torch.cuda.is_available():
         raise RuntimeError("PiD precisa de CUDA para carregar e inferir no ComfyUI.")
 
     cache_key = (backbone, ckpt_type)
+    handle = _prepare_handle(backbone, ckpt_type)
     if _ACTIVE_RUNTIME is not None and _ACTIVE_RUNTIME.cache_key == cache_key:
-        return _HANDLE_CACHE[cache_key], _ACTIVE_RUNTIME.model
+        return handle, _ACTIVE_RUNTIME.model
 
     _release_active_runtime()
+    checkpoint_path = Path(handle.checkpoint_path)
     _ensure_upstream_path()
-    _ensure_assets(backbone, ckpt_type)
-
     from pid._src.inference.checkpoint_registry import get_pid_checkpoint
+    pid_checkpoint = get_pid_checkpoint(backbone, ckpt_type)
     from pid._src.utils.model_loader import load_model_from_checkpoint
 
-    pid_checkpoint = get_pid_checkpoint(backbone, ckpt_type)
-    checkpoint_path = (UPSTREAM_ROOT / pid_checkpoint.checkpoint_path).resolve()
     with _pushd(UPSTREAM_ROOT):
         model, _config = load_model_from_checkpoint(
             experiment_name=pid_checkpoint.experiment,
@@ -521,31 +1017,46 @@ def _load_runtime(backbone: str, ckpt_type: str) -> tuple[PiDHandle, Any]:
             experiment_opts=_tokenizer_overrides(backbone),
             strict=False,
         )
-
-    model = _to_light_model(model)
+    model = _to_light_model(model, backbone)
     _prepare_model_for_inference(model)
-    handle = PiDHandle(
-        backbone=backbone,
-        ckpt_type=ckpt_type,
-        pid_scale=pid_checkpoint.pid_scale,
-        latent_channels=LATENT_CHANNELS[backbone],
-        latent_compression=LATENT_COMPRESSION[backbone],
-        input_caption_key=model.config.input_caption_key,
-        checkpoint_path=str(checkpoint_path),
-        device="cuda",
-    )
-    _HANDLE_CACHE[cache_key] = handle
     _ACTIVE_RUNTIME = _PiDLoadedRuntime(cache_key=cache_key, model=model)
     return handle, model
 
 
 def load_pid_model(backbone: str, ckpt_type: str) -> PiDHandle:
-    handle, _model = _load_runtime(backbone, ckpt_type)
-    return handle
+    return _prepare_handle(backbone, ckpt_type)
 
 
 def _get_model(handle: PiDHandle) -> Any:
     _handle, model = _load_runtime(handle.backbone, handle.ckpt_type)
+    return model
+
+
+def _get_encode_model(handle: PiDHandle) -> Any:
+    cache_key = (handle.backbone, handle.ckpt_type)
+    if _ACTIVE_RUNTIME is not None and _ACTIVE_RUNTIME.cache_key == cache_key:
+        return _ACTIVE_RUNTIME.model
+
+    model = _VAE_ONLY_CACHE.get(cache_key)
+    if model is not None:
+        return model
+
+    _prepare_handle(handle.backbone, handle.ckpt_type)
+    _ensure_upstream_path()
+    config = _native_pid_config(handle.backbone)
+    vae_encoder = _instantiate_vae_encoder(handle.backbone, config.tokenizer_config)
+    _set_module_eval(vae_encoder)
+    _disable_module_grads(vae_encoder)
+    model = _LightPiDModel(
+        net=None,
+        config=config,
+        precision=torch.float32,
+        autocast_dtype=None,
+        fm_timescale=1000.0,
+        text_encoder=None,
+        vae_encoder=vae_encoder,
+    )
+    _VAE_ONLY_CACHE[cache_key] = model
     return model
 
 
@@ -561,12 +1072,31 @@ def _normalize_pid_prompt(pid_prompt: Any) -> PiDPrompt:
     raise TypeError("O prompt do PiD precisa ser um PiDPrompt ou dict com 'caption_embs'.")
 
 
-def _encode_prompt_once(handle: PiDHandle, prompt: str) -> PiDPrompt:
-    cache_key = (handle.backbone, handle.ckpt_type, prompt)
+def _resolve_pid_prompt(handle: PiDHandle, prompt: str, pid_prompt: Any = None, clip: Any = None) -> PiDPrompt:
+    prompt_text = str(prompt or "")
+    if pid_prompt is None:
+        return _encode_prompt_once(handle, prompt_text, clip=clip)
+
+    normalized = _normalize_pid_prompt(pid_prompt)
+    if prompt_text.strip() and prompt_text != normalized.prompt:
+        return _encode_prompt_once(handle, prompt_text, clip=clip)
+    return normalized
+
+
+def _encode_prompt_once(handle: PiDHandle, prompt: str, clip: Any = None) -> PiDPrompt:
+    cache_key = (handle.backbone, handle.ckpt_type, prompt) if clip is None else ("external", str(id(clip)), prompt)
     cached = _PROMPT_CACHE.get(cache_key)
     if cached is not None:
         _PROMPT_CACHE.move_to_end(cache_key)
         return cached
+
+    if clip is not None:
+        prompt_value = _encode_prompt_with_external_clip(clip, prompt)
+        _PROMPT_CACHE[cache_key] = prompt_value
+        _PROMPT_CACHE.move_to_end(cache_key)
+        while len(_PROMPT_CACHE) > MAX_PROMPT_CACHE_ITEMS:
+            _PROMPT_CACHE.popitem(last=False)
+        return prompt_value
 
     model = _get_model(handle)
     if hasattr(model, "_ensure_text_encoder_loaded"):
@@ -574,9 +1104,11 @@ def _encode_prompt_once(handle: PiDHandle, prompt: str) -> PiDPrompt:
     text_encoder = getattr(model, "text_encoder", None)
     if text_encoder is None:
         raise RuntimeError("O modelo PiD carregado nao possui text_encoder.")
-    _set_module_device(text_encoder, handle.device)
+    if not _is_comfy_clip_text_encoder(text_encoder):
+        _set_module_device(text_encoder, handle.device)
     with torch.inference_mode():
         caption_embs, attention_mask = model._encode_text_raw([prompt])
+    _validate_pid_prompt_tensors(caption_embs, attention_mask, prompt_source="O text encoder do PiD")
     _offload_aux_modules(model)
 
     prompt_value = PiDPrompt(
@@ -591,8 +1123,8 @@ def _encode_prompt_once(handle: PiDHandle, prompt: str) -> PiDPrompt:
     return prompt_value
 
 
-def encode_prompt(handle: PiDHandle, prompt: str) -> dict[str, torch.Tensor | str]:
-    encoded = _encode_prompt_once(handle, prompt)
+def encode_prompt(handle: PiDHandle, prompt: str, clip: Any = None) -> dict[str, torch.Tensor | str]:
+    encoded = _encode_prompt_once(handle, prompt, clip=clip)
     return {
         "caption_embs": encoded.caption_embs,
         "attention_mask": encoded.attention_mask,
@@ -640,36 +1172,37 @@ def _pick_aligned_image_size(height: int, width: int, alignment: int) -> tuple[i
     if alignment <= 1:
         return max(1, int(height)), max(1, int(width))
 
-    if height % alignment == 0 and width % alignment == 0:
-        return int(height), int(width)
+    return _nearest_multiple(height, alignment), _nearest_multiple(width, alignment)
 
-    candidates: list[tuple[int, int]] = []
 
-    target_h = _nearest_multiple(height, alignment)
-    scaled_w = max(1, int(round(width * (target_h / max(1, height)))))
-    candidates.append((target_h, _nearest_multiple(scaled_w, alignment)))
+def _center_crop_or_pad_image_tensor(
+    image_tensor: torch.Tensor,
+    target_height: int,
+    target_width: int,
+) -> torch.Tensor:
+    height = int(image_tensor.shape[1])
+    width = int(image_tensor.shape[2])
+    if (target_height, target_width) == (height, width):
+        return image_tensor
 
-    target_w = _nearest_multiple(width, alignment)
-    scaled_h = max(1, int(round(height * (target_w / max(1, width)))))
-    candidates.append((_nearest_multiple(scaled_h, alignment), target_w))
+    crop_top = max(0, (height - target_height) // 2)
+    crop_left = max(0, (width - target_width) // 2)
+    crop_bottom = crop_top + min(height, target_height)
+    crop_right = crop_left + min(width, target_width)
+    cropped = image_tensor[:, crop_top:crop_bottom, crop_left:crop_right, :].contiguous()
 
-    # Fall back to direct rounding on both axes if the scale-anchored candidates
-    # still drift too much on extreme aspect ratios.
-    candidates.append((_nearest_multiple(height, alignment), _nearest_multiple(width, alignment)))
+    pad_h = max(0, target_height - int(cropped.shape[1]))
+    pad_w = max(0, target_width - int(cropped.shape[2]))
+    if pad_h == 0 and pad_w == 0:
+        return cropped
 
-    base_ratio = float(height) / float(width)
-
-    def _score(size: tuple[int, int]) -> tuple[float, float, float, int]:
-        target_height, target_width = size
-        scale_y = target_height / float(height)
-        scale_x = target_width / float(width)
-        ratio_error = abs((target_height / float(target_width)) - base_ratio) / max(base_ratio, 1e-8)
-        anisotropy = abs(scale_y - scale_x)
-        scale_change = abs(scale_y - 1.0) + abs(scale_x - 1.0)
-        area_delta = abs((target_height * target_width) - (height * width))
-        return (ratio_error, anisotropy, scale_change, area_delta)
-
-    return min(candidates, key=_score)
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    chw_image = cropped.permute(0, 3, 1, 2).contiguous()
+    padded = F.pad(chw_image, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate")
+    return padded.permute(0, 2, 3, 1).contiguous()
 
 
 def _autocorrect_encode_image_tensor(handle: PiDHandle, image_tensor: torch.Tensor) -> torch.Tensor:
@@ -681,9 +1214,7 @@ def _autocorrect_encode_image_tensor(handle: PiDHandle, image_tensor: torch.Tens
     if (target_height, target_width) == (height, width):
         return image_tensor
 
-    chw_image = image_tensor.permute(0, 3, 1, 2).contiguous()
-    resized = _resize_spatial_tensor(chw_image, (target_height, target_width), "bilinear")
-    return resized.permute(0, 2, 3, 1).contiguous().clamp(0.0, 1.0)
+    return _center_crop_or_pad_image_tensor(image_tensor, target_height, target_width).clamp(0.0, 1.0)
 
 
 def _get_preview_size() -> int:
@@ -695,16 +1226,16 @@ def _get_preview_size() -> int:
         return 512
 
 
-def _make_preview_tuple(image: torch.Tensor):
+def _get_preview_dimensions(height: int, width: int) -> tuple[int, int]:
     preview_size = _get_preview_size()
+    scale = min(preview_size / max(height, 1), preview_size / max(width, 1), 1.0) if preview_size > 0 else 1.0
+    return max(1, int(round(height * scale))), max(1, int(round(width * scale)))
+
+
+def _make_preview_tuple(image: torch.Tensor):
     preview_tensor = image[:1].float().clamp(0, 1)
-    if preview_size > 0:
-        height = int(preview_tensor.shape[-2])
-        width = int(preview_tensor.shape[-1])
-        scale = min(preview_size / max(height, 1), preview_size / max(width, 1), 1.0)
-        if scale < 1.0:
-            target_height = max(1, int(round(height * scale)))
-            target_width = max(1, int(round(width * scale)))
+    target_height, target_width = _get_preview_dimensions(int(preview_tensor.shape[-2]), int(preview_tensor.shape[-1]))
+    if (target_height, target_width) != tuple(preview_tensor.shape[-2:]):
             preview_tensor = F.interpolate(
                 preview_tensor,
                 size=(target_height, target_width),
@@ -714,19 +1245,109 @@ def _make_preview_tuple(image: torch.Tensor):
             )
 
     arr = (preview_tensor[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype("uint8")
-    return ("JPEG", Image.fromarray(arr), preview_size)
+    return ("JPEG", Image.fromarray(arr), _get_preview_size())
 
 
-def encode_image_to_latent(handle: PiDHandle, image: Any) -> dict[str, torch.Tensor]:
-    model = _get_model(handle)
+def _make_tiled_composed_preview(output: torch.Tensor, weight_sum: torch.Tensor):
+    composed = output[:1].permute(0, 3, 1, 2).float()
+    weights = weight_sum[:1].permute(0, 3, 1, 2).float().clamp_min(1e-6)
+    target_height, target_width = _get_preview_dimensions(int(composed.shape[-2]), int(composed.shape[-1]))
+    if (target_height, target_width) != tuple(composed.shape[-2:]):
+            composed = F.interpolate(
+                composed,
+                size=(target_height, target_width),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+            weights = F.interpolate(
+                weights,
+                size=(target_height, target_width),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            ).clamp_min(1e-6)
+
+    return _make_preview_tuple((composed / weights).clamp(0, 1))
+
+
+def _write_tile_to_preview_canvas(
+    canvas: torch.Tensor,
+    tile_image: torch.Tensor,
+    out_y: int,
+    out_x: int,
+    output_h: int,
+    output_w: int,
+) -> None:
+    preview_h = int(canvas.shape[1])
+    preview_w = int(canvas.shape[2])
+    tile_h = int(tile_image.shape[1])
+    tile_w = int(tile_image.shape[2])
+    start_y = min(preview_h - 1, max(0, int(round(out_y * preview_h / max(output_h, 1)))))
+    start_x = min(preview_w - 1, max(0, int(round(out_x * preview_w / max(output_w, 1)))))
+    end_y = min(preview_h, max(start_y + 1, int(round((out_y + tile_h) * preview_h / max(output_h, 1)))))
+    end_x = min(preview_w, max(start_x + 1, int(round((out_x + tile_w) * preview_w / max(output_w, 1)))))
+
+    resized = F.interpolate(
+        tile_image.permute(0, 3, 1, 2).float(),
+        size=(end_y - start_y, end_x - start_x),
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    ).permute(0, 2, 3, 1).contiguous()
+    canvas[:, start_y:end_y, start_x:end_x, :] = resized
+
+
+def encode_image_to_latent(
+    handle: PiDHandle,
+    image: Any,
+    encode_tile_size: int | None = None,
+) -> dict[str, torch.Tensor]:
+    model = _get_encode_model(handle)
+    if hasattr(model, "_ensure_vae_encoder_loaded"):
+        model._ensure_vae_encoder_loaded()
+    _set_runtime_net_device(model, "cpu")
+    text_encoder = getattr(model, "text_encoder", None)
+    if _is_comfy_clip_text_encoder(text_encoder):
+        try:
+            import comfy.model_management
+
+            comfy.model_management.unload_model_and_clones(text_encoder.patcher)
+        except Exception:
+            pass
+    else:
+        _set_module_device(text_encoder, "cpu")
+    _empty_cuda_cache()
+
     image_tensor = _autocorrect_encode_image_tensor(handle, _extract_image_tensor(image))
+    vae_encoder = getattr(model, "vae_encoder", None)
+    vae_dtype = getattr(vae_encoder, "dtype", torch.float32)
+    if vae_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        vae_dtype = torch.float32
 
-    chw_image = image_tensor.permute(0, 3, 1, 2).contiguous()
-    vae_input = (chw_image * 2.0 - 1.0).clamp(-1.0, 1.0).to(device=handle.device, dtype=torch.float32)
-
-    _set_module_device(getattr(model, "vae_encoder", None), handle.device)
-    with torch.inference_mode():
-        latent = model.encode_lq_latent(vae_input)
+    chw_image = image_tensor.movedim(-1, 1)
+    _set_module_device(vae_encoder, handle.device)
+    height = int(chw_image.shape[-2])
+    width = int(chw_image.shape[-1])
+    if encode_tile_size is None:
+        vae_input = chw_image.to(device=handle.device, dtype=vae_dtype, non_blocking=True)
+        vae_input.mul_(2.0).add_(-1.0).clamp_(-1.0, 1.0)
+        with torch.inference_mode():
+            latent = model.encode_lq_latent(vae_input)
+        del vae_input
+    else:
+        tile_size = max(handle.latent_compression, int(encode_tile_size))
+        tile_size = max(handle.latent_compression, (tile_size // handle.latent_compression) * handle.latent_compression)
+        overlap = int(AUTOENCODE_TILE_OVERLAP.get(handle.backbone, 128))
+        overlap = max(0, min(tile_size - handle.latent_compression, (overlap // handle.latent_compression) * handle.latent_compression))
+        latent = _encode_image_to_latent_tiled(
+            handle=handle,
+            model=model,
+            chw_image=chw_image,
+            vae_dtype=vae_dtype,
+            tile_size=tile_size,
+            tile_overlap=overlap,
+        )
     _offload_aux_modules(model)
 
     if latent.ndim != 4:
@@ -738,6 +1359,107 @@ def encode_image_to_latent(handle: PiDHandle, image: Any) -> dict[str, torch.Ten
         )
 
     return {"samples": latent.float().cpu()}
+
+
+def _latent_tile_weight_mask(
+    height: int,
+    width: int,
+    overlap: int,
+    top_edge: bool,
+    bottom_edge: bool,
+    left_edge: bool,
+    right_edge: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    return _tile_weight_mask(
+        height=height,
+        width=width,
+        overlap=overlap,
+        top_edge=top_edge,
+        bottom_edge=bottom_edge,
+        left_edge=left_edge,
+        right_edge=right_edge,
+        device=device,
+    ).permute(0, 3, 1, 2).contiguous()
+
+
+def _encode_image_to_latent_tiled(
+    handle: PiDHandle,
+    model: Any,
+    chw_image: torch.Tensor,
+    vae_dtype: torch.dtype,
+    tile_size: int,
+    tile_overlap: int,
+) -> torch.Tensor:
+    batch_size = int(chw_image.shape[0])
+    height = int(chw_image.shape[-2])
+    width = int(chw_image.shape[-1])
+    compression = int(handle.latent_compression)
+    latent_h = height // compression
+    latent_w = width // compression
+    overlap_latent = tile_overlap // compression
+    starts_y = _compute_tile_starts(height, tile_size, tile_overlap)
+    starts_x = _compute_tile_starts(width, tile_size, tile_overlap)
+
+    output = torch.zeros((batch_size, handle.latent_channels, latent_h, latent_w), dtype=torch.float32, device="cpu")
+    weight_sum = torch.zeros((1, 1, latent_h, latent_w), dtype=torch.float32, device="cpu")
+    weight_cache: dict[tuple[int, int, int, bool, bool, bool, bool], torch.Tensor] = {}
+
+    for start_y in starts_y:
+        for start_x in starts_x:
+            end_y = min(start_y + tile_size, height)
+            end_x = min(start_x + tile_size, width)
+            pixel_tile = chw_image[:, :, start_y:end_y, start_x:end_x]
+            vae_input = pixel_tile.to(device=handle.device, dtype=vae_dtype, non_blocking=True)
+            vae_input.mul_(2.0).add_(-1.0).clamp_(-1.0, 1.0)
+
+            with torch.inference_mode():
+                latent_tile = model.encode_lq_latent(vae_input).float().cpu()
+            del vae_input
+
+            latent_start_y = start_y // compression
+            latent_start_x = start_x // compression
+            tile_latent_h = int(latent_tile.shape[-2])
+            tile_latent_w = int(latent_tile.shape[-1])
+            weight_key = (
+                tile_latent_h,
+                tile_latent_w,
+                min(overlap_latent, tile_latent_h // 2, tile_latent_w // 2),
+                start_y == 0,
+                end_y == height,
+                start_x == 0,
+                end_x == width,
+            )
+            weight = weight_cache.get(weight_key)
+            if weight is None:
+                weight = _latent_tile_weight_mask(
+                    height=tile_latent_h,
+                    width=tile_latent_w,
+                    overlap=weight_key[2],
+                    top_edge=weight_key[3],
+                    bottom_edge=weight_key[4],
+                    left_edge=weight_key[5],
+                    right_edge=weight_key[6],
+                    device=torch.device("cpu"),
+                )
+                weight_cache[weight_key] = weight
+
+            output[
+                :,
+                :,
+                latent_start_y : latent_start_y + tile_latent_h,
+                latent_start_x : latent_start_x + tile_latent_w,
+            ] += latent_tile * weight
+            weight_sum[
+                :,
+                :,
+                latent_start_y : latent_start_y + tile_latent_h,
+                latent_start_x : latent_start_x + tile_latent_w,
+            ] += weight
+            del latent_tile
+            _empty_cuda_cache()
+
+    return output / weight_sum.clamp_min(1e-6)
 
 
 def _resize_spatial_tensor(tensor: torch.Tensor, size: tuple[int, int], interpolation: str) -> torch.Tensor:
@@ -915,6 +1637,7 @@ def _decode_samples(
     preview_enabled: bool = False,
     noise: torch.Tensor | None = None,
     progress_advance: int = 1,
+    step_preview_callback: Any = None,
 ) -> torch.Tensor:
     if latent_tensor.shape[1] != handle.latent_channels:
         raise ValueError(
@@ -923,6 +1646,8 @@ def _decode_samples(
         )
 
     model = _get_model(handle)
+    if hasattr(model, "ensure_model_loaded"):
+        model.ensure_model_loaded()
     device = handle.device
     baseline_h = int(latent_tensor.shape[-2]) * handle.latent_compression
     baseline_w = int(latent_tensor.shape[-1]) * handle.latent_compression
@@ -933,8 +1658,8 @@ def _decode_samples(
     precision = _get_execution_dtype(model)
     _set_runtime_net_device(model, device, precision=precision)
     caption_embs = pid_prompt.caption_embs
-    if caption_embs.ndim != 3:
-        raise ValueError(f"caption_embs invalido para PiD: {tuple(caption_embs.shape)}.")
+    attention_mask = pid_prompt.attention_mask
+    _validate_pid_prompt_tensors(caption_embs, attention_mask, prompt_source="O condicionamento PiD")
     if caption_embs.shape[0] == 1 and batch_size > 1:
         caption_embs = caption_embs.expand(batch_size, -1, -1)
     elif caption_embs.shape[0] != batch_size:
@@ -943,7 +1668,11 @@ def _decode_samples(
         )
 
     caption_embs = caption_embs.to(device=device, dtype=precision)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device=device, dtype=torch.int64)
     latent_state = latent_tensor.to(device=device, dtype=precision)
+    if hasattr(model, "base_model"):
+        latent_state = _native_lq_latent_process_in(handle.backbone, latent_state)
     sigma_tensor = torch.full((batch_size,), float(degrade_sigma), device=device, dtype=torch.float32)
 
     gen = torch.Generator(device=device).manual_seed(int(seed))
@@ -971,19 +1700,37 @@ def _decode_samples(
         student_timestep = float(getattr(model.config, "student_timestep", 1.0))
         if effective_steps == 1:
             t_student = torch.full((batch_size,), student_timestep, device=device, dtype=torch.float32)
-            t_student_scaled = t_student * model.fm_trainer.timescale
-            with autocast_ctx:
-                v_student = net(
+            if hasattr(model, "predict_x0"):
+                x0_student = model.predict_x0(
                     noise,
-                    t_student_scaled,
+                    t_student,
                     caption_embs,
-                    lq_video_or_image=None,
-                    lq_latent=latent_state,
-                    degrade_sigma=sigma_tensor,
+                    attention_mask,
+                    latent_state,
+                    sigma_tensor,
                 )
-                x0_student = model._velocity_to_x0(noise, v_student, t_student)
+            else:
+                t_student_scaled = t_student * model.fm_trainer.timescale
+                with autocast_ctx:
+                    v_student = net(
+                        noise,
+                        t_student_scaled,
+                        caption_embs,
+                        lq_video_or_image=None,
+                        lq_latent=latent_state,
+                        degrade_sigma=sigma_tensor,
+                    )
+                    x0_student = model._velocity_to_x0(noise, v_student, t_student)
             if progress is not None:
-                progress.update(advance=progress_advance, preview=_preview_tuple_from_x0(x0_student))
+                preview_tuple = _preview_tuple_from_x0(x0_student)
+                if step_preview_callback is not None and preview_tuple is not None:
+                    step_preview_callback((x0_student.float().clamp(-1, 1) * 0.5 + 0.5).clamp(0, 1))
+                else:
+                    progress.update(
+                        advance=progress_advance,
+                        preview=preview_tuple,
+                        emit_bar=preview_enabled,
+                    )
         else:
             t_list = model._get_t_list(device=torch.device(device), num_steps=effective_steps)
             x = noise
@@ -991,25 +1738,36 @@ def _decode_samples(
             with autocast_ctx:
                 for t_cur, t_next in zip(t_list[:-1], t_list[1:]):
                     t_cur_batch = t_cur.expand(batch_size)
-                    t_cur_scaled = t_cur_batch * timescale
-
-                    v_pred = net(
-                        x,
-                        t_cur_scaled,
-                        caption_embs,
-                        lq_video_or_image=None,
-                        lq_latent=latent_state,
-                        degrade_sigma=sigma_tensor,
-                    )
+                    if hasattr(model, "predict_x0"):
+                        x0_pred = model.predict_x0(
+                            x,
+                            t_cur_batch,
+                            caption_embs,
+                            attention_mask,
+                            latent_state,
+                            sigma_tensor,
+                        )
+                        t_shape = [batch_size] + [1] * (x.ndim - 1)
+                        v_pred = ((x.double() - x0_pred.double()) / t_cur_batch.double().view(*t_shape).clamp(min=5e-2)).to(x.dtype)
+                    else:
+                        t_cur_scaled = t_cur_batch * timescale
+                        v_pred = net(
+                            x,
+                            t_cur_scaled,
+                            caption_embs,
+                            lq_video_or_image=None,
+                            lq_latent=latent_state,
+                            degrade_sigma=sigma_tensor,
+                        )
+                        x0_pred = model._velocity_to_x0(x, v_pred, t_cur_batch)
 
                     if t_next.item() > 0:
                         if student_sample_type == "ode":
                             v_for_step = model._net_output_to_velocity(x, v_pred, t_cur_batch, prediction_type)
                             dt = t_next - t_cur
                             x = x + dt * v_for_step
-                            preview_x0 = model._velocity_to_x0(x, v_pred, t_cur_batch)
+                            preview_x0 = x0_pred
                         else:
-                            x0_pred = model._velocity_to_x0(x, v_pred, t_cur_batch)
                             eps_infer = torch.randn(
                                 x0_pred.shape,
                                 device=x0_pred.device,
@@ -1021,11 +1779,19 @@ def _decode_samples(
                             x = (1.0 - t_next_bcast) * x0_pred + t_next_bcast * eps_infer
                             preview_x0 = x0_pred
                     else:
-                        x = model._velocity_to_x0(x, v_pred, t_cur_batch)
+                        x = x0_pred
                         preview_x0 = x
 
                     if progress is not None:
-                        progress.update(advance=progress_advance, preview=_preview_tuple_from_x0(preview_x0))
+                        preview_tuple = _preview_tuple_from_x0(preview_x0)
+                        if step_preview_callback is not None and preview_tuple is not None:
+                            step_preview_callback((preview_x0.float().clamp(-1, 1) * 0.5 + 0.5).clamp(0, 1))
+                        else:
+                            progress.update(
+                                advance=progress_advance,
+                                preview=preview_tuple,
+                                emit_bar=preview_enabled,
+                            )
             x0_student = x
     return x0_student.clamp(-1, 1).unsqueeze(2)
 
@@ -1034,6 +1800,12 @@ def _samples_to_comfy_image(samples: torch.Tensor) -> torch.Tensor:
     image = samples.squeeze(2).float().clamp(-1, 1)
     image = (image * 0.5 + 0.5).clamp(0, 1)
     return image.permute(0, 2, 3, 1).cpu()
+
+
+def _samples_to_image_tensor(samples: torch.Tensor) -> torch.Tensor:
+    image = samples.squeeze(2).float().clamp(-1, 1)
+    image = (image * 0.5 + 0.5).clamp(0, 1)
+    return image.permute(0, 2, 3, 1).contiguous()
 
 
 def _compute_tile_starts(total: int, tile: int, overlap: int) -> list[int]:
@@ -1082,6 +1854,18 @@ def _tile_weight_mask(
     return (weight_y[:, None] * weight_x[None, :]).unsqueeze(0).unsqueeze(-1)
 
 
+def _group_tile_jobs_by_decode_shape(tile_jobs: list[_ExpandedTileDecodeJob]) -> list[list[_ExpandedTileDecodeJob]]:
+    grouped: dict[tuple[int, int], list[_ExpandedTileDecodeJob]] = {}
+    order: list[tuple[int, int]] = []
+    for job in tile_jobs:
+        key = (job.decode_end_y - job.decode_start_y, job.decode_end_x - job.decode_start_x)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(job)
+    return [grouped[key] for key in order]
+
+
 def decode_latent(
     handle: PiDHandle,
     latent: Any,
@@ -1091,9 +1875,10 @@ def decode_latent(
     seed: int,
     degrade_sigma: float,
     pid_prompt: Any = None,
+    clip: Any = None,
     unique_id: str | None = None,
 ) -> torch.Tensor:
-    prompt_value = _normalize_pid_prompt(pid_prompt) if pid_prompt is not None else _encode_prompt_once(handle, prompt)
+    prompt_value = _resolve_pid_prompt(handle, prompt, pid_prompt=pid_prompt, clip=clip)
     effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else 4
     progress = _DecodeProgress(total=max(1, effective_steps), node_id=unique_id)
     samples = _decode_samples(
@@ -1122,6 +1907,7 @@ def decode_latent_tiled(
     tile_overlap: int,
     tile_batch_size: int = 1,
     pid_prompt: Any = None,
+    clip: Any = None,
     unique_id: str | None = None,
 ) -> torch.Tensor:
     latent_tensor = _extract_latent_tensor(latent)
@@ -1160,95 +1946,136 @@ def decode_latent_tiled(
     overlap_out = tile_overlap * handle.pid_scale
 
     batch_size = int(latent_tensor.shape[0])
-    output = torch.zeros((batch_size, output_h, output_w, 3), dtype=torch.float32)
-    weight_sum = torch.zeros((batch_size, output_h, output_w, 1), dtype=torch.float32)
+    compose_device = torch.device("cpu")
+    output = torch.zeros((batch_size, output_h, output_w, 3), dtype=torch.float32, device=compose_device)
+    weight_sum = torch.zeros((batch_size, output_h, output_w, 1), dtype=torch.float32, device=compose_device)
 
-    prompt_value = _normalize_pid_prompt(pid_prompt) if pid_prompt is not None else _encode_prompt_once(handle, prompt)
+    prompt_value = _resolve_pid_prompt(handle, prompt, pid_prompt=pid_prompt, clip=clip)
     tile_count = len(expanded_jobs)
     effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else 4
     progress = _DecodeProgress(total=max(1, tile_count * max(1, effective_steps)), node_id=unique_id)
     model = _get_model(handle)
     precision = _get_execution_dtype(model)
-    full_noise = _make_decode_noise(batch_size, output_h, output_w, handle.device, seed, dtype=precision)
+    full_noise = _make_decode_noise(batch_size, output_h, output_w, "cpu", seed, dtype=torch.float32)
+    preview_h, preview_w = _get_preview_dimensions(output_h, output_w)
+    preview_canvas = torch.zeros((batch_size, preview_h, preview_w, 3), dtype=torch.float32, device=compose_device)
 
-    index = 0
-    while index < tile_count:
-        first_job = expanded_jobs[index]
-        first_h = first_job.decode_end_y - first_job.decode_start_y
-        first_w = first_job.decode_end_x - first_job.decode_start_x
-        job_batch = [first_job]
-        index += 1
+    weight_cache: dict[tuple[int, int, int, bool, bool, bool, bool], torch.Tensor] = {}
+    grouped_jobs = _group_tile_jobs_by_decode_shape(expanded_jobs)
 
-        while index < tile_count and len(job_batch) < tile_batch_size:
-            candidate = expanded_jobs[index]
-            if (candidate.decode_end_y - candidate.decode_start_y, candidate.decode_end_x - candidate.decode_start_x) != (first_h, first_w):
-                break
-            job_batch.append(candidate)
-            index += 1
+    for job_group in grouped_jobs:
+        group_index = 0
+        while group_index < len(job_group):
+            job_batch = job_group[group_index : group_index + tile_batch_size]
+            group_index += len(job_batch)
 
-        latent_batch = torch.cat(
-            [
-                latent_tensor[:, :, job.decode_start_y : job.decode_end_y, job.decode_start_x : job.decode_end_x].contiguous()
-                for job in job_batch
-            ],
-            dim=0,
-        )
-        noise_batch = torch.cat(
-            [
-                full_noise[
-                    :,
-                    :,
-                    job.decode_start_y * compression * handle.pid_scale : job.decode_end_y * compression * handle.pid_scale,
-                    job.decode_start_x * compression * handle.pid_scale : job.decode_end_x * compression * handle.pid_scale,
-                ].contiguous()
-                for job in job_batch
-            ],
-            dim=0,
-        )
-        tile_samples = _decode_samples(
-            handle=handle,
-            latent_tensor=latent_batch,
-            pid_prompt=_repeat_pid_prompt(prompt_value, len(job_batch), batch_size),
-            cfg_scale=cfg_scale,
-            pid_inference_steps=pid_inference_steps,
-            seed=seed,
-            degrade_sigma=degrade_sigma,
-            progress=progress,
-            preview_enabled=False,
-            noise=noise_batch,
-            progress_advance=len(job_batch),
-        )
-        tile_images = _samples_to_comfy_image(tile_samples)
-
-        for offset, job in enumerate(job_batch):
-            tile_image = tile_images[offset * batch_size : (offset + 1) * batch_size]
-            target_h = (job.target_end_y - job.target_start_y) * compression * handle.pid_scale
-            target_w = (job.target_end_x - job.target_start_x) * compression * handle.pid_scale
-            tile_image = tile_image[:, job.crop_y : job.crop_y + target_h, job.crop_x : job.crop_x + target_w, :]
-            tile_h = int(tile_image.shape[1])
-            tile_w = int(tile_image.shape[2])
-            weight = _tile_weight_mask(
-                height=tile_h,
-                width=tile_w,
-                overlap=min(overlap_out, tile_h // 2, tile_w // 2),
-                top_edge=job.target_start_y == 0,
-                bottom_edge=job.target_end_y == int(latent_tensor.shape[-2]),
-                left_edge=job.target_start_x == 0,
-                right_edge=job.target_end_x == int(latent_tensor.shape[-1]),
-                device=tile_image.device,
+            latent_batch = torch.cat(
+                [
+                    latent_tensor[:, :, job.decode_start_y : job.decode_end_y, job.decode_start_x : job.decode_end_x].contiguous()
+                    for job in job_batch
+                ],
+                dim=0,
             )
-            output[:, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w, :] += tile_image * weight
-            weight_sum[:, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w, :] += weight
+            noise_batch = torch.cat(
+                [
+                    full_noise[
+                        :,
+                        :,
+                        job.decode_start_y * compression * handle.pid_scale : job.decode_end_y * compression * handle.pid_scale,
+                        job.decode_start_x * compression * handle.pid_scale : job.decode_end_x * compression * handle.pid_scale,
+                    ].contiguous()
+                    for job in job_batch
+                ],
+                dim=0,
+            )
 
-        composed = output / weight_sum.clamp_min(1e-6)
-        preview = None
-        try:
-            preview = _make_preview_tuple(composed.permute(0, 3, 1, 2))
-        except Exception:
-            preview = None
-        progress.update(advance=0, preview=preview)
+            def _step_preview_callback(step_images: torch.Tensor) -> None:
+                preview_frame = preview_canvas.clone()
+                step_images_cpu = step_images.to(device=compose_device)
+                if step_images_cpu.ndim != 4:
+                    return
+                if int(step_images_cpu.shape[-1]) != 3 and int(step_images_cpu.shape[1]) == 3:
+                    step_images_cpu = step_images_cpu.permute(0, 2, 3, 1).contiguous()
+                for offset, job in enumerate(job_batch):
+                    tile_image = step_images_cpu[offset * batch_size : (offset + 1) * batch_size]
+                    target_h = (job.target_end_y - job.target_start_y) * compression * handle.pid_scale
+                    target_w = (job.target_end_x - job.target_start_x) * compression * handle.pid_scale
+                    tile_image = tile_image[:, job.crop_y : job.crop_y + target_h, job.crop_x : job.crop_x + target_w, :]
+                    _write_tile_to_preview_canvas(
+                        preview_frame,
+                        tile_image,
+                        job.out_y,
+                        job.out_x,
+                        output_h,
+                        output_w,
+                    )
+                progress.update(advance=len(job_batch), preview=_make_preview_tuple(preview_frame.permute(0, 3, 1, 2)), emit_bar=True)
 
-    return output / weight_sum.clamp_min(1e-6)
+            tile_samples = _decode_samples(
+                handle=handle,
+                latent_tensor=latent_batch,
+                pid_prompt=_repeat_pid_prompt(prompt_value, len(job_batch), batch_size),
+                cfg_scale=cfg_scale,
+                pid_inference_steps=pid_inference_steps,
+                seed=seed,
+                degrade_sigma=degrade_sigma,
+                progress=progress,
+                preview_enabled=True,
+                noise=noise_batch,
+                progress_advance=len(job_batch),
+                step_preview_callback=_step_preview_callback,
+            )
+            tile_images = _samples_to_image_tensor(tile_samples).to(device=compose_device)
+
+            for offset, job in enumerate(job_batch):
+                tile_image = tile_images[offset * batch_size : (offset + 1) * batch_size]
+                target_h = (job.target_end_y - job.target_start_y) * compression * handle.pid_scale
+                target_w = (job.target_end_x - job.target_start_x) * compression * handle.pid_scale
+                tile_image = tile_image[:, job.crop_y : job.crop_y + target_h, job.crop_x : job.crop_x + target_w, :]
+                tile_h = int(tile_image.shape[1])
+                tile_w = int(tile_image.shape[2])
+                weight_key = (
+                    tile_h,
+                    tile_w,
+                    min(overlap_out, tile_h // 2, tile_w // 2),
+                    job.target_start_y == 0,
+                    job.target_end_y == int(latent_tensor.shape[-2]),
+                    job.target_start_x == 0,
+                    job.target_end_x == int(latent_tensor.shape[-1]),
+                )
+                weight = weight_cache.get(weight_key)
+                if weight is None:
+                    weight = _tile_weight_mask(
+                        height=tile_h,
+                        width=tile_w,
+                        overlap=weight_key[2],
+                        top_edge=weight_key[3],
+                        bottom_edge=weight_key[4],
+                        left_edge=weight_key[5],
+                        right_edge=weight_key[6],
+                        device=compose_device,
+                    )
+                    weight_cache[weight_key] = weight
+                output[:, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w, :] += tile_image * weight
+                weight_sum[:, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w, :] += weight
+                _write_tile_to_preview_canvas(
+                    preview_canvas,
+                    tile_image,
+                    job.out_y,
+                    job.out_x,
+                    output_h,
+                    output_w,
+                )
+
+    final_preview = None
+    try:
+        final_preview = _make_tiled_composed_preview(output, weight_sum)
+    except Exception:
+        final_preview = None
+    if final_preview is not None:
+        progress.update(advance=0, preview=final_preview, emit_bar=True)
+
+    return (output / weight_sum.clamp_min(1e-6)).cpu()
 
 
 def pid_ksampler(
@@ -1264,6 +2091,7 @@ def pid_ksampler(
     tile_overlap: int = 64,
     tile_batch_size: int = 1,
     pid_prompt: Any = None,
+    clip: Any = None,
     unique_id: str | None = None,
 ) -> torch.Tensor:
     try:
@@ -1280,6 +2108,7 @@ def pid_ksampler(
                 tile_overlap=tile_overlap,
                 tile_batch_size=tile_batch_size,
                 pid_prompt=pid_prompt,
+                clip=clip,
                 unique_id=unique_id,
             )
 
@@ -1292,6 +2121,7 @@ def pid_ksampler(
             seed=seed,
             degrade_sigma=degrade_sigma,
             pid_prompt=pid_prompt,
+            clip=clip,
             unique_id=unique_id,
         )
     finally:

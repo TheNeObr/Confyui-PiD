@@ -60,6 +60,7 @@ class PiDDecodeLatent:
             },
             "optional": {
                 "pid_prompt": ("PID_PROMPT",),
+                "clip": ("CLIP",),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -75,6 +76,7 @@ class PiDDecodeLatent:
         seed: int,
         degrade_sigma: float,
         pid_prompt=None,
+        clip=None,
         unique_id=None,
     ):
         image = decode_latent(
@@ -86,6 +88,7 @@ class PiDDecodeLatent:
             seed=seed,
             degrade_sigma=degrade_sigma,
             pid_prompt=pid_prompt,
+            clip=clip,
             unique_id=unique_id,
         )
         return _with_resolution_ui(image)
@@ -103,11 +106,13 @@ class PiDEncodeImage:
             "required": {
                 "pid_model": ("PID_MODEL",),
                 "image": ("IMAGE",),
+                "encode_tile_size": (["disabled", "512", "1024"], {"default": "disabled"}),
             }
         }
 
-    def encode(self, pid_model, image):
-        return (encode_image_to_latent(pid_model, image),)
+    def encode(self, pid_model, image, encode_tile_size):
+        tile_size = None if encode_tile_size == "disabled" else int(encode_tile_size)
+        return (encode_image_to_latent(pid_model, image, encode_tile_size=tile_size),)
 
 
 class PiDEncodePrompt:
@@ -122,11 +127,14 @@ class PiDEncodePrompt:
             "required": {
                 "pid_model": ("PID_MODEL",),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
-            }
+            },
+            "optional": {
+                "clip": ("CLIP",),
+            },
         }
 
-    def encode(self, pid_model, prompt: str):
-        return (encode_prompt(pid_model, prompt),)
+    def encode(self, pid_model, prompt: str, clip=None):
+        return (encode_prompt(pid_model, prompt, clip=clip),)
 
 
 class PiDKSampler:
@@ -153,6 +161,7 @@ class PiDKSampler:
             },
             "optional": {
                 "pid_prompt": ("PID_PROMPT",),
+                "clip": ("CLIP",),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -173,6 +182,7 @@ class PiDKSampler:
         tile_overlap: int,
         tile_batch_size: int,
         pid_prompt=None,
+        clip=None,
         unique_id=None,
     ):
         image = pid_ksampler(
@@ -188,6 +198,7 @@ class PiDKSampler:
             tile_overlap=tile_overlap,
             tile_batch_size=tile_batch_size,
             pid_prompt=pid_prompt,
+            clip=clip,
             unique_id=unique_id,
         )
         return _with_resolution_ui(image)
@@ -215,6 +226,7 @@ class PiDDecodeLatentTiled:
             },
             "optional": {
                 "pid_prompt": ("PID_PROMPT",),
+                "clip": ("CLIP",),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -233,6 +245,7 @@ class PiDDecodeLatentTiled:
         seed: int,
         degrade_sigma: float,
         pid_prompt=None,
+        clip=None,
         unique_id=None,
     ):
         image = decode_latent_tiled(
@@ -247,6 +260,7 @@ class PiDDecodeLatentTiled:
             seed=seed,
             degrade_sigma=degrade_sigma,
             pid_prompt=pid_prompt,
+            clip=clip,
             unique_id=unique_id,
         )
         return _with_resolution_ui(image)

@@ -21,10 +21,12 @@ function addResolutionWidget(nodeType) {
     container.style.display = "flex";
     container.style.alignItems = "center";
     container.style.justifyContent = "space-between";
-    container.style.width = "100%";
+    container.style.width = "calc(100% - 12px)";
+    container.style.maxWidth = "calc(100% - 12px)";
     container.style.height = "24px";
     container.style.boxSizing = "border-box";
-    container.style.padding = "0 10px";
+    container.style.padding = "0 8px";
+    container.style.margin = "0 6px";
     container.style.marginTop = "-10px";
     container.style.border = "1px solid rgba(120, 136, 160, 0.35)";
     container.style.borderRadius = "12px";
@@ -32,15 +34,18 @@ function addResolutionWidget(nodeType) {
     container.style.color = "#cfd6e6";
     container.style.fontSize = "13px";
     container.style.gap = "8px";
+    container.style.overflow = "hidden";
 
     const label = document.createElement("span");
     label.textContent = "resolution";
     label.style.opacity = "0.9";
     label.style.whiteSpace = "nowrap";
+    label.style.flex = "0 0 auto";
 
     const value = document.createElement("span");
     value.textContent = "";
-    value.style.flex = "1";
+    value.style.flex = "1 1 auto";
+    value.style.minWidth = "0";
     value.style.textAlign = "right";
     value.style.whiteSpace = "nowrap";
     value.style.overflow = "hidden";
@@ -52,7 +57,7 @@ function addResolutionWidget(nodeType) {
       serialize: false,
       hideOnZoom: false,
     });
-    widget.computeSize = (width) => [Math.max(120, (width ?? this.size?.[0] ?? 280) - 20), 24];
+    widget.computeSize = (width) => [Math.max(120, (width ?? this.size?.[0] ?? 280) - 28), 24];
     widget._pidResolutionValueEl = value;
     this._pidResolutionValueEl = value;
     return result;

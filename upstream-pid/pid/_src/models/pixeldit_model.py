@@ -98,7 +98,7 @@ def _load_text_encoder(name: str, device: str = "cuda"):
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "right"
-    text_encoder = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16).get_decoder().to(device)
+    text_encoder = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16).get_decoder().to(device)
     text_encoder.eval()
     text_encoder.requires_grad_(False)
 
