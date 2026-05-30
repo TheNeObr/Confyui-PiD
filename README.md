@@ -58,6 +58,8 @@ Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, with
 ## Example
 
 - Example workflow: [`workflow_pid_flux2_2kto4k_tiled.json`](./workflow_pid_flux2_2kto4k_tiled.json)
+- Additional workflow example: [`FLUX2_ERNIE-PID.json`](./FLUX2_ERNIE-PID.json)
+- Additional tiled workflow example: [`PID TILED WORFLOW.json`](./PID%20TILED%20WORFLOW.json)
 - Example output image:
 
 ![PiD example output](./pid_512-2048_flux1_upscale_example.png)
