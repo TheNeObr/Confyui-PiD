@@ -35,6 +35,7 @@ AUTOENCODE_TILE_OVERLAP = {"flux": 128, "sd3": 128, "flux2": 128}
 # Tiles muito pequenos tendem a colapsar a cor no PiD; decodificamos com contexto maior
 # e recortamos o centro para manter a saida pedida sem o desvio verde.
 MIN_TILED_DECODE_SIZE = 512
+LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 
 _HANDLE_CACHE: dict[tuple[str, str], "PiDHandle"] = {}
 _PROMPT_CACHE: "OrderedDict[tuple[str, str, str], PiDPrompt]" = OrderedDict()
@@ -1147,6 +1148,15 @@ def _extract_latent_tensor(latent: Any) -> torch.Tensor:
     return latent_tensor
 
 
+def _extract_latent_geometry(latent: Any) -> dict[str, int] | None:
+    if not isinstance(latent, dict):
+        return None
+    geometry = latent.get(LATENT_IMAGE_GEOMETRY_KEY)
+    if not isinstance(geometry, dict):
+        return None
+    return geometry
+
+
 def _extract_image_tensor(image: Any) -> torch.Tensor:
     if not torch.is_tensor(image):
         raise TypeError("O input IMAGE precisa ser um torch.Tensor do ComfyUI.")
@@ -1168,11 +1178,40 @@ def _nearest_multiple(value: int, alignment: int) -> int:
     return upper
 
 
+def _round_up_multiple(value: int, alignment: int) -> int:
+    if alignment <= 1:
+        return max(1, int(value))
+    return max(alignment, ((int(value) + alignment - 1) // alignment) * alignment)
+
+
 def _pick_aligned_image_size(height: int, width: int, alignment: int) -> tuple[int, int]:
     if alignment <= 1:
         return max(1, int(height)), max(1, int(width))
 
-    return _nearest_multiple(height, alignment), _nearest_multiple(width, alignment)
+    return _round_up_multiple(height, alignment), _round_up_multiple(width, alignment)
+
+
+def _build_encode_image_geometry(handle: PiDHandle, image_tensor: torch.Tensor) -> dict[str, int] | None:
+    height = int(image_tensor.shape[1])
+    width = int(image_tensor.shape[2])
+    alignment = max(1, int(handle.latent_compression * handle.pid_scale))
+    target_height, target_width = _pick_aligned_image_size(height, width, alignment)
+    if (target_height, target_width) == (height, width):
+        return None
+
+    pad_h = max(0, target_height - height)
+    pad_w = max(0, target_width - width)
+    return {
+        "original_height": height,
+        "original_width": width,
+        "aligned_height": target_height,
+        "aligned_width": target_width,
+        "pad_top": pad_h // 2,
+        "pad_bottom": pad_h - (pad_h // 2),
+        "pad_left": pad_w // 2,
+        "pad_right": pad_w - (pad_w // 2),
+        "pid_scale": int(handle.pid_scale),
+    }
 
 
 def _center_crop_or_pad_image_tensor(
@@ -1205,16 +1244,26 @@ def _center_crop_or_pad_image_tensor(
     return padded.permute(0, 2, 3, 1).contiguous()
 
 
-def _autocorrect_encode_image_tensor(handle: PiDHandle, image_tensor: torch.Tensor) -> torch.Tensor:
-    height = int(image_tensor.shape[1])
-    width = int(image_tensor.shape[2])
-    alignment = max(1, int(handle.latent_compression * handle.pid_scale))
-    target_height, target_width = _pick_aligned_image_size(height, width, alignment)
-
-    if (target_height, target_width) == (height, width):
+def _pad_image_tensor(image_tensor: torch.Tensor, geometry: dict[str, int] | None) -> torch.Tensor:
+    if geometry is None:
         return image_tensor
+    chw_image = image_tensor.permute(0, 3, 1, 2).contiguous()
+    padded = F.pad(
+        chw_image,
+        (
+            int(geometry["pad_left"]),
+            int(geometry["pad_right"]),
+            int(geometry["pad_top"]),
+            int(geometry["pad_bottom"]),
+        ),
+        mode="replicate",
+    )
+    return padded.permute(0, 2, 3, 1).contiguous()
 
-    return _center_crop_or_pad_image_tensor(image_tensor, target_height, target_width).clamp(0.0, 1.0)
+
+def _autocorrect_encode_image_tensor(handle: PiDHandle, image_tensor: torch.Tensor) -> torch.Tensor:
+    geometry = _build_encode_image_geometry(handle, image_tensor)
+    return _pad_image_tensor(image_tensor, geometry).clamp(0.0, 1.0)
 
 
 def _get_preview_size() -> int:
@@ -1319,7 +1368,9 @@ def encode_image_to_latent(
         _set_module_device(text_encoder, "cpu")
     _empty_cuda_cache()
 
-    image_tensor = _autocorrect_encode_image_tensor(handle, _extract_image_tensor(image))
+    source_image = _extract_image_tensor(image)
+    image_geometry = _build_encode_image_geometry(handle, source_image)
+    image_tensor = _pad_image_tensor(source_image, image_geometry).clamp(0.0, 1.0)
     vae_encoder = getattr(model, "vae_encoder", None)
     vae_dtype = getattr(vae_encoder, "dtype", torch.float32)
     if vae_dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -1358,7 +1409,10 @@ def encode_image_to_latent(
             f"mas o modelo espera {handle.latent_channels}."
         )
 
-    return {"samples": latent.float().cpu()}
+    latent_dict: dict[str, Any] = {"samples": latent.float().cpu()}
+    if image_geometry is not None:
+        latent_dict[LATENT_IMAGE_GEOMETRY_KEY] = dict(image_geometry)
+    return latent_dict
 
 
 def _latent_tile_weight_mask(
@@ -1495,6 +1549,7 @@ def resize_latent(latent: Any, latent_scale: float, interpolation: str) -> Any:
 
     resized_latent = dict(latent)
     resized_latent["samples"] = resized_samples
+    resized_latent.pop(LATENT_IMAGE_GEOMETRY_KEY, None)
     if "noise_mask" in resized_latent and torch.is_tensor(resized_latent["noise_mask"]):
         noise_mask = resized_latent["noise_mask"]
         if noise_mask.ndim == 2:
@@ -1508,6 +1563,26 @@ def resize_latent(latent: Any, latent_scale: float, interpolation: str) -> Any:
             resized_noise_mask = noise_mask
         resized_latent["noise_mask"] = resized_noise_mask
     return resized_latent
+
+
+def _restore_output_geometry(image: torch.Tensor, latent: Any, handle: PiDHandle) -> torch.Tensor:
+    geometry = _extract_latent_geometry(latent)
+    if geometry is None:
+        return image
+
+    pad_top = max(0, int(geometry.get("pad_top", 0)))
+    pad_left = max(0, int(geometry.get("pad_left", 0)))
+    original_height = max(1, int(geometry.get("original_height", int(image.shape[1]) // max(1, handle.pid_scale))))
+    original_width = max(1, int(geometry.get("original_width", int(image.shape[2]) // max(1, handle.pid_scale))))
+    scale = max(1, int(geometry.get("pid_scale", handle.pid_scale)))
+
+    start_y = min(int(image.shape[1]), pad_top * scale)
+    start_x = min(int(image.shape[2]), pad_left * scale)
+    end_y = min(int(image.shape[1]), start_y + original_height * scale)
+    end_x = min(int(image.shape[2]), start_x + original_width * scale)
+    if start_y >= end_y or start_x >= end_x:
+        return image
+    return image[:, start_y:end_y, start_x:end_x, :].contiguous()
 
 
 def _repeat_pid_prompt(pid_prompt: PiDPrompt, repeat_blocks: int, base_batch: int) -> PiDPrompt:
@@ -1892,7 +1967,7 @@ def decode_latent(
         progress=progress,
         preview_enabled=True,
     )
-    return _samples_to_comfy_image(samples)
+    return _restore_output_geometry(_samples_to_comfy_image(samples), latent, handle)
 
 
 def decode_latent_tiled(
@@ -2067,15 +2142,16 @@ def decode_latent_tiled(
                     output_w,
                 )
 
+    final_image = _restore_output_geometry((output / weight_sum.clamp_min(1e-6)).cpu(), latent, handle)
     final_preview = None
     try:
-        final_preview = _make_tiled_composed_preview(output, weight_sum)
+        final_preview = _make_preview_tuple(final_image.permute(0, 3, 1, 2))
     except Exception:
         final_preview = None
     if final_preview is not None:
         progress.update(advance=0, preview=final_preview, emit_bar=True)
 
-    return (output / weight_sum.clamp_min(1e-6)).cpu()
+    return final_image
 
 
 def pid_ksampler(

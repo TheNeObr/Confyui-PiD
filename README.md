@@ -9,6 +9,7 @@ Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, with
 - Supports image encoding with PiD's own encoder to generate compatible latents.
 - Keeps the runtime lazy so loading the node does not immediately force the full PiD network and text stack onto GPU.
 - Uses a lighter VAE-only path for image encoding and an on-demand internal Gemma 2 loader when no external `CLIP` is connected.
+- Preserves the original framing during image encode/decode by aligning with padding instead of destructive crop shifts.
 - Decodes `LATENT -> IMAGE` in the standard flow or in tiles for larger resolutions.
 - Shows CLI progress for `PiD KSampler` with steps, `it/s`, and ETA, while tiled preview updates progressively in the node.
 
@@ -28,6 +29,7 @@ Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, with
 - `PiD Encode Image`
   - Inputs: `PID_MODEL`, `IMAGE`, `encode_tile_size`.
   - Uses only the PiD VAE path to produce a compatible latent.
+  - Stores the original image geometry inside the produced latent so the final decode can restore the original framing automatically.
   - Supports `disabled`, `512`, and `1024` tiled encode modes to reduce the encode memory spike on larger images.
   - Output: `LATENT`.
 
@@ -113,7 +115,8 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 - The internal Gemma 2 is only downloaded on demand when PiD needs to encode prompts without an external ComfyUI `CLIP`.
 - If you connect an external ComfyUI `CLIP` loaded with `type = pixeldit`, PiD uses that `clip` input and does not need the internal Gemma 2 at prompt time.
 - `PiD Encode Image` now uses a lighter VAE-only runtime instead of forcing the full PiD runtime for image encode.
-- The automatic encode correction keeps the original proportions by using centered crop/pad instead of resizing the source image.
+- The automatic encode correction now uses alignment-safe central padding instead of destructive crop-down sizing, which avoids output shift in image comparisons.
+- The latent produced by `PiD Encode Image` stores the original geometry and decode nodes crop the final result back to the original framing automatically for a more pixel-perfect comparison workflow.
 - `PiD Encode Image` includes optional tiled encode modes (`512` and `1024`) to reduce VRAM spikes during latent creation.
 - Development and validation for this custom node were tested on an NVIDIA RTX 3090.
 - The recommended minimum GPU memory for practical use is 16 GB of VRAM.

@@ -251,6 +251,7 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertEqual(tuple(latent["samples"].shape), (1, 16, 8, 12))
         self.assertEqual(tuple(model.last_image.shape), (1, 3, 64, 96))
         self.assertTrue(torch.allclose(model.last_image, torch.ones_like(model.last_image)))
+        self.assertNotIn(pid_runtime.LATENT_IMAGE_GEOMETRY_KEY, latent)
 
     def test_encode_image_to_latent_offloads_net_before_vae_encode(self):
         model = DummyModel()
@@ -287,8 +288,22 @@ class PiDRuntimeTests(unittest.TestCase):
             image=torch.ones((1, 70, 95, 3), dtype=torch.float32),
         )
 
-        self.assertEqual(tuple(model.last_image.shape), (1, 3, 64, 96))
-        self.assertEqual(tuple(latent["samples"].shape), (1, 16, 8, 12))
+        self.assertEqual(tuple(model.last_image.shape), (1, 3, 96, 96))
+        self.assertEqual(tuple(latent["samples"].shape), (1, 16, 12, 12))
+        self.assertEqual(
+            latent[pid_runtime.LATENT_IMAGE_GEOMETRY_KEY],
+            {
+                "original_height": 70,
+                "original_width": 95,
+                "aligned_height": 96,
+                "aligned_width": 96,
+                "pad_top": 13,
+                "pad_bottom": 13,
+                "pad_left": 0,
+                "pad_right": 1,
+                "pid_scale": 4,
+            },
+        )
 
     def test_encode_image_to_latent_autocorrects_flux2_alignment(self):
         model = DummyModel(encode_latent_channels=128, encode_compression=16)
@@ -299,7 +314,8 @@ class PiDRuntimeTests(unittest.TestCase):
             image=torch.ones((1, 1000, 1537, 3), dtype=torch.float32),
         )
 
-        self.assertEqual(tuple(latent["samples"].shape), (1, 128, 64, 96))
+        self.assertEqual(tuple(model.last_image.shape), (1, 3, 1024, 1600))
+        self.assertEqual(tuple(latent["samples"].shape), (1, 128, 64, 100))
 
     def test_autocorrect_encode_image_tensor_preserves_pixels_without_resizing(self):
         handle = self._register_runtime(DummyModel(), backbone="flux", latent_channels=16, latent_compression=8)
@@ -307,9 +323,41 @@ class PiDRuntimeTests(unittest.TestCase):
 
         corrected = pid_runtime._autocorrect_encode_image_tensor(handle, image)
 
-        self.assertEqual(tuple(corrected.shape), (1, 64, 96, 3))
-        self.assertTrue(torch.equal(corrected[:, :, :95, :], image[:, 3:67, :, :]))
-        self.assertTrue(torch.equal(corrected[:, :, 95:96, :], image[:, 3:67, 94:95, :]))
+        self.assertEqual(tuple(corrected.shape), (1, 96, 96, 3))
+        self.assertTrue(torch.equal(corrected[:, 13:83, :95, :], image))
+        self.assertTrue(torch.equal(corrected[:, :13, :95, :], image[:, :1, :, :].expand(-1, 13, -1, -1)))
+        self.assertTrue(torch.equal(corrected[:, 83:96, :95, :], image[:, 69:70, :, :].expand(-1, 13, -1, -1)))
+        self.assertTrue(torch.equal(corrected[:, :, 95:96, :], corrected[:, :, 94:95, :]))
+
+    def test_decode_latent_restores_original_output_geometry_after_encode_padding(self):
+        model = DummyModel()
+        handle = self._register_runtime(model, backbone="flux", latent_channels=16, latent_compression=8)
+        latent = {
+            "samples": torch.zeros((1, 16, 12, 12), dtype=torch.float32),
+            pid_runtime.LATENT_IMAGE_GEOMETRY_KEY: {
+                "original_height": 70,
+                "original_width": 95,
+                "aligned_height": 96,
+                "aligned_width": 96,
+                "pad_top": 13,
+                "pad_bottom": 13,
+                "pad_left": 0,
+                "pad_right": 1,
+                "pid_scale": 4,
+            },
+        }
+
+        image = pid_runtime.decode_latent(
+            handle=handle,
+            latent=latent,
+            prompt="cat",
+            cfg_scale=1.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 280, 380, 3))
 
     def test_decode_latent_tiled_blends_tiles_into_full_image(self):
         model = DummyModel()
@@ -331,6 +379,38 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertEqual(tuple(image.shape), (1, 128, 128, 3))
         self.assertTrue(torch.allclose(image, torch.ones_like(image)))
         self.assertGreaterEqual(model.call_count, 9)
+
+    def test_decode_latent_tiled_restores_original_output_geometry_after_encode_padding(self):
+        model = DummyModel()
+        handle = self._register_runtime(model, backbone="flux", latent_channels=16, latent_compression=8)
+
+        image = pid_runtime.decode_latent_tiled(
+            handle=handle,
+            latent={
+                "samples": torch.zeros((1, 16, 12, 12), dtype=torch.float32),
+                pid_runtime.LATENT_IMAGE_GEOMETRY_KEY: {
+                    "original_height": 70,
+                    "original_width": 95,
+                    "aligned_height": 96,
+                    "aligned_width": 96,
+                    "pad_top": 13,
+                    "pad_bottom": 13,
+                    "pad_left": 0,
+                    "pad_right": 1,
+                    "pid_scale": 4,
+                },
+            },
+            prompt="cat",
+            cfg_scale=1.0,
+            pid_inference_steps=4,
+            seed=3,
+            degrade_sigma=0.0,
+            tile_size=32,
+            tile_overlap=8,
+            tile_batch_size=1,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 280, 380, 3))
 
     def test_decode_latent_tiled_batches_same_size_tiles(self):
         model = DummyModel()
@@ -602,12 +682,14 @@ class PiDRuntimeTests(unittest.TestCase):
         latent = {
             "samples": torch.zeros((1, 16, 8, 8), dtype=torch.float32),
             "noise_mask": torch.ones((1, 8, 8), dtype=torch.float32),
+            pid_runtime.LATENT_IMAGE_GEOMETRY_KEY: {"original_height": 64, "original_width": 64, "pid_scale": 4},
         }
 
         resized = pid_runtime.resize_latent(latent, 0.5, "bicubic")
 
         self.assertEqual(tuple(resized["samples"].shape), (1, 16, 4, 4))
         self.assertEqual(tuple(resized["noise_mask"].shape), (1, 4, 4))
+        self.assertNotIn(pid_runtime.LATENT_IMAGE_GEOMETRY_KEY, resized)
 
     def test_encode_prompt_reuses_cached_embeddings(self):
         model = DummyModel()
