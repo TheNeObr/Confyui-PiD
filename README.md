@@ -39,12 +39,12 @@ Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, with
   - Output: `IMAGE`.
 
 - `PiD Decode Latent Tiled`
-  - Inputs: `PID_MODEL`, `LATENT`, `tile_size`, `tile_overlap`, `tile_batch_size`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
+  - Inputs: `PID_MODEL`, `LATENT`, `tile_size`, `tile_overlap`, `tile_batch_size`, `seam_refine`, `seam_refine_strength`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
   - Optional input: `PID_PROMPT`.
   - Output: `IMAGE`.
 
 - `PiD KSampler`
-  - Inputs: `PID_MODEL`, `LATENT`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`, `keep_model_loaded_on_gpu`, `use_tiled`, `tile_size`, `tile_overlap`, `tile_batch_size`.
+  - Inputs: `PID_MODEL`, `LATENT`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`, `keep_model_loaded_on_gpu`, `use_tiled`, `tile_size`, `tile_overlap`, `tile_batch_size`, `seam_refine`, `seam_refine_strength`.
   - Optional input: `PID_PROMPT`.
   - Shows step progress, `it/s`, and ETA in the CLI during generation.
   - In tiled mode, shows an incremental low-resolution preview during tile restoration and replaces it with the final blended composition when done.
@@ -70,6 +70,11 @@ The node uses a stochastic sampler (SDE) by default. Since the distilled DMD2 ch
 ### Tiled SDE Noise Boost (`tiled_sde_noise_boost`)
 - Applied only when tiled sampling is active. The default `1.15` compensates for the more conservative local tile context without changing direct decoding.
 - Increase gradually toward `1.30` or `1.50` when tiled restoration preserves too much of the input. Values above `1.50` may introduce grain or seams.
+
+### Seam Refinement (`seam_refine`)
+- Runs an optional second tiled restoration pass after the primary tiled image has been assembled.
+- The second pass shifts the tile grid by half a stride, uses the first result as a low-denoise source image, and blends back only the overlap bands and their intersections.
+- Start with `seam_refine_strength = 0.25`. Increase gradually toward `0.40` when seams remain visible. Higher values cost the same VRAM window but may change local details more aggressively.
 
 ### Restoration Control
 - `restoration_strength` was removed because it blended the generated RGB output with the source after sampling. When reconstruction geometry differed, that post-process produced shadows and duplicated edges.
@@ -161,6 +166,7 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 - The decode node shows only `height x width` in a compact read-only `resolution` field below the preview, without creating extra graph outputs.
 - In tiled sampling, `tile_size` is the effective inference-window limit. A requested `512` tile is processed as a `512` tile instead of being silently expanded to a larger direct-decode window.
 - Tiled sampling keeps the full-frame diffusion state and blend accumulators in system RAM, transferring only the active tile window to CUDA to prevent VRAM usage from scaling with the complete output canvas.
+- Optional `seam_refine` performs a second shifted-grid pass over the assembled result and feather-blends only the original overlap bands. This improves continuity without increasing the configured inference-window size.
 - Green artifacts can also appear in non-tiled decoding when aspect-ratio changes or custom resolutions push the latent outside the model's most stable size/alignment range. This is not limited to `4:3`; the bigger issue is usually latent/grid alignment and using a checkpoint variant outside the resolution range where it is most stable.
 - As a practical rule, `2k` is usually the safer choice around a `512` base workflow, while `2kto4k` is usually the safer choice around a `1024` base workflow.
 - Using the `2k` checkpoint variant with `1024` in direct non-tiled decoding can still be accepted by the model, but it is more likely to produce green artifacts, color collapse, or unstable results than the same workflow at `512`.

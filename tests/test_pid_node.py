@@ -472,6 +472,43 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertAlmostEqual(patched_decode.call_args.kwargs["sde_noise_strength"], 1.35)
 
+    def test_decode_latent_tiled_refines_seams_with_shifted_second_pass(self):
+        handle = self._register_runtime(DummyModel())
+        pid_prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM)),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="cat",
+        )
+        primary = torch.zeros((1, 3, 1, 128, 128), dtype=torch.float32)
+        refined = torch.ones((1, 3, 1, 128, 128), dtype=torch.float32)
+
+        with (
+            mock.patch.object(pid_runtime, "_resolve_pid_prompt", return_value=pid_prompt),
+            mock.patch.object(pid_runtime, "_decode_samples", side_effect=[primary, refined]) as patched_decode,
+        ):
+            image = pid_runtime.decode_latent_tiled(
+                handle=handle,
+                latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
+                prompt="cat",
+                negative_prompt="",
+                cfg_scale=1.0,
+                pid_inference_steps=4,
+                seed=3,
+                degrade_sigma=0.0,
+                tile_size=16,
+                tile_overlap=8,
+                tile_batch_size=1,
+                seam_refine=True,
+                seam_refine_strength=0.25,
+            )
+
+        self.assertEqual(patched_decode.call_count, 2)
+        refine_kwargs = patched_decode.call_args_list[1].kwargs
+        self.assertEqual(refine_kwargs["tile_grid_offset"], 8)
+        self.assertAlmostEqual(refine_kwargs["source_denoise_strength"], 0.25)
+        self.assertAlmostEqual(image[0, 0, 0, 0].item(), 0.5)
+        self.assertGreater(image[0, 48, 48, 0].item(), 0.5)
+
     def test_decode_latent_tiled_batches_same_size_tiles(self):
         model = DummyModel()
         handle = self._register_runtime(model)
@@ -769,6 +806,23 @@ class PiDRuntimeTests(unittest.TestCase):
             test_tensor = torch.ones((1, 3, 32, 32))
             res = pid_runtime._native_lq_latent_process_in("unknown", test_tensor)
             self.assertTrue(torch.equal(res, test_tensor))
+
+    def test_shifted_tile_starts_offset_the_interior_grid_and_keep_edges(self):
+        starts = pid_runtime._compute_shifted_tile_starts(total=10, tile=4, overlap=1, offset=2)
+        self.assertEqual(starts, [0, 2, 5, 6])
+
+    def test_seam_refine_mask_targets_overlaps_and_intersections(self):
+        mask = pid_runtime._make_seam_refine_mask(
+            latent_h=4,
+            latent_w=4,
+            tile_latent=2,
+            overlap_latent=1,
+            compression=8,
+            pid_scale=4,
+        )
+        self.assertEqual(tuple(mask.shape), (1, 1, 1, 128, 128))
+        self.assertEqual(mask[0, 0, 0, 0, 0].item(), 0.0)
+        self.assertGreater(mask[0, 0, 0, 48, 48].item(), 0.0)
 
     def test_removed_backbones_are_rejected(self):
         for backbone in ("zimage", "dinov2", "siglip"):
@@ -1698,6 +1752,8 @@ class PiDNodeTests(unittest.TestCase):
             scheduler="original",
             sde_noise_strength=1.0,
             tiled_sde_noise_boost=1.15,
+            seam_refine=False,
+            seam_refine_strength=0.25,
         )
         self.assertEqual(result["result"], (sentinel,))
         self.assertEqual(result["ui"]["text"], ("64 x 64",))
@@ -1733,6 +1789,8 @@ class PiDNodeTests(unittest.TestCase):
             scheduler="original",
             sde_noise_strength=1.0,
             tiled_sde_noise_boost=1.15,
+            seam_refine=False,
+            seam_refine_strength=0.25,
         )
         self.assertEqual(result["result"], (sentinel,))
         self.assertEqual(result["ui"]["text"], ("64 x 64",))

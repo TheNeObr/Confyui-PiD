@@ -1704,9 +1704,20 @@ def _iter_tile_jobs(
     pid_scale: int,
     tile_latent: int,
     overlap_latent: int,
+    grid_offset_latent: int = 0,
 ) -> list[_TileDecodeJob]:
-    starts_y = _compute_tile_starts(int(latent_tensor.shape[-2]), tile_latent, overlap_latent)
-    starts_x = _compute_tile_starts(int(latent_tensor.shape[-1]), tile_latent, overlap_latent)
+    starts_y = _compute_shifted_tile_starts(
+        int(latent_tensor.shape[-2]),
+        tile_latent,
+        overlap_latent,
+        grid_offset_latent,
+    )
+    starts_x = _compute_shifted_tile_starts(
+        int(latent_tensor.shape[-1]),
+        tile_latent,
+        overlap_latent,
+        grid_offset_latent,
+    )
     jobs: list[_TileDecodeJob] = []
     for start_y in starts_y:
         for start_x in starts_x:
@@ -1804,6 +1815,7 @@ def _decode_samples(
     tile_size: int = 256,
     tile_overlap: int = 64,
     tile_batch_size: int = 1,
+    tile_grid_offset: int = 0,
 ) -> torch.Tensor:
     if latent_tensor.shape[1] != handle.latent_channels:
         raise ValueError(
@@ -1907,8 +1919,19 @@ def _decode_samples(
         compression = handle.latent_compression
         tile_latent = tile_size // compression
         overlap_latent = tile_overlap // compression
-        starts_y = _compute_tile_starts(int(latent_tensor.shape[-2]), tile_latent, overlap_latent)
-        starts_x = _compute_tile_starts(int(latent_tensor.shape[-1]), tile_latent, overlap_latent)
+        grid_offset_latent = max(0, int(tile_grid_offset) // compression)
+        starts_y = _compute_shifted_tile_starts(
+            int(latent_tensor.shape[-2]),
+            tile_latent,
+            overlap_latent,
+            grid_offset_latent,
+        )
+        starts_x = _compute_shifted_tile_starts(
+            int(latent_tensor.shape[-1]),
+            tile_latent,
+            overlap_latent,
+            grid_offset_latent,
+        )
         actual_overlap_y = (tile_latent - (starts_y[1] - starts_y[0])) * compression * handle.pid_scale if len(starts_y) > 1 else 0
         actual_overlap_x = (tile_latent - (starts_x[1] - starts_x[0])) * compression * handle.pid_scale if len(starts_x) > 1 else 0
 
@@ -1916,7 +1939,14 @@ def _decode_samples(
         # Expanding FLUX2 tiles to its direct-decode minimum defeats tiling and
         # can turn a requested 512 window back into a costly 1024 inference.
         min_size = tile_size
-        tile_jobs = _iter_tile_jobs(latent_tensor, compression, handle.pid_scale, tile_latent, overlap_latent)
+        tile_jobs = _iter_tile_jobs(
+            latent_tensor,
+            compression,
+            handle.pid_scale,
+            tile_latent,
+            overlap_latent,
+            grid_offset_latent=grid_offset_latent,
+        )
         expanded_jobs = [
             _expand_tile_job(
                 job=job,
@@ -1937,7 +1967,7 @@ def _decode_samples(
         print(
             f"PiD tiled plan: {len(tile_jobs)} tiles, {unique_window_count} unique windows, "
             f"max inference window {max_window_w}x{max_window_h}, tile_batch_size={tile_batch_size}, "
-            "global state=cpu.",
+            f"grid_offset={grid_offset_latent * compression}, global state=cpu.",
             flush=True,
         )
         weight_cache_cpu = {}
@@ -2292,6 +2322,62 @@ def _compute_tile_starts(total: int, tile: int, overlap: int) -> list[int]:
     return starts
 
 
+def _compute_shifted_tile_starts(total: int, tile: int, overlap: int, offset: int = 0) -> list[int]:
+    base_starts = _compute_tile_starts(total, tile, overlap)
+    if total <= tile or offset <= 0:
+        return base_starts
+
+    max_start = total - tile
+    stride = tile - overlap
+    starts = [0]
+    current = min(max_start, int(offset))
+    while current < max_start:
+        starts.append(current)
+        current += stride
+    starts.append(max_start)
+    return sorted(set(starts))
+
+
+def _make_seam_refine_mask(
+    latent_h: int,
+    latent_w: int,
+    tile_latent: int,
+    overlap_latent: int,
+    compression: int,
+    pid_scale: int,
+) -> torch.Tensor:
+    starts_y = _compute_tile_starts(latent_h, tile_latent, overlap_latent)
+    starts_x = _compute_tile_starts(latent_w, tile_latent, overlap_latent)
+    output_scale = compression * pid_scale
+    output_h = latent_h * output_scale
+    output_w = latent_w * output_scale
+
+    def _axis_mask(total_output: int, starts: list[int]) -> torch.Tensor:
+        axis = torch.zeros((total_output,), dtype=torch.float32, device="cpu")
+        for previous, current in zip(starts[:-1], starts[1:]):
+            band_start = current * output_scale
+            band_end = min(total_output, (previous + tile_latent) * output_scale)
+            if band_end <= band_start:
+                center = min(total_output - 1, max(0, band_start))
+                radius = max(1, output_scale // 2)
+                band_start = max(0, center - radius)
+                band_end = min(total_output, center + radius + 1)
+            width = band_end - band_start
+            if width <= 0:
+                continue
+            positions = torch.arange(width, dtype=torch.float32)
+            center = (width - 1) * 0.5
+            radius = max(1.0, (width + 1) * 0.5)
+            feather = (1.0 - (positions - center).abs() / radius).clamp(0.0, 1.0)
+            axis[band_start:band_end] = torch.maximum(axis[band_start:band_end], feather)
+        return axis
+
+    mask_y = _axis_mask(output_h, starts_y)
+    mask_x = _axis_mask(output_w, starts_x)
+    mask = torch.maximum(mask_y[:, None], mask_x[None, :])
+    return mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
+
 def _tile_weight_mask(
     height: int,
     width: int,
@@ -2468,6 +2554,8 @@ def decode_latent_tiled(
     scheduler: str = "original",
     sde_noise_strength: float = 1.0,
     tiled_sde_noise_boost: float = 1.15,
+    seam_refine: bool = False,
+    seam_refine_strength: float = 0.25,
 ) -> torch.Tensor:
     compression = handle.latent_compression
     if tile_size % compression != 0:
@@ -2544,6 +2632,66 @@ def decode_latent_tiled(
         tile_batch_size=tile_batch_size,
     )
 
+    if seam_refine:
+        tile_latent = tile_size // compression
+        overlap_latent = tile_overlap // compression
+        seam_mask = _make_seam_refine_mask(
+            latent_h=int(latent_tensor.shape[-2]),
+            latent_w=int(latent_tensor.shape[-1]),
+            tile_latent=tile_latent,
+            overlap_latent=overlap_latent,
+            compression=compression,
+            pid_scale=handle.pid_scale,
+        )
+        if seam_mask.max().item() > 0.0:
+            seam_refine_strength = max(0.0, min(1.0, float(seam_refine_strength)))
+            seam_grid_offset = max(
+                compression,
+                ((max(compression, tile_size - tile_overlap) // 2) // compression) * compression,
+            )
+            print(
+                f"PiD seam refine: shifted grid offset={seam_grid_offset}, "
+                f"strength={seam_refine_strength:.2f}.",
+                flush=True,
+            )
+            refine_progress = _DecodeProgress(total=max(1, effective_steps), node_id=unique_id)
+
+            def _refine_preview_callback(step_images: torch.Tensor) -> None:
+                try:
+                    preview_tuple = _make_preview_tuple(step_images)
+                except Exception:
+                    preview_tuple = None
+                refine_progress.update(advance=1, preview=preview_tuple, emit_bar=True)
+
+            refined_samples = _decode_samples(
+                handle=handle,
+                latent_tensor=latent_tensor,
+                pid_prompt=prompt_value,
+                cfg_scale=cfg_scale,
+                pid_inference_steps=pid_inference_steps,
+                seed=int(seed) + 1,
+                degrade_sigma=degrade_sigma,
+                lq_conditioning_boost=lq_conditioning_boost,
+                source_image=_samples_to_image_tensor(samples),
+                source_denoise_strength=seam_refine_strength,
+                source_detail_noise_boost=source_detail_noise_boost,
+                uncond_pid_prompt=uncond_prompt_value,
+                progress=refine_progress,
+                preview_enabled=True,
+                progress_advance=1,
+                step_preview_callback=_refine_preview_callback,
+                sampler=sampler,
+                scheduler=scheduler,
+                sde_noise_strength=effective_sde_noise_strength,
+                use_tiled=True,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
+                tile_batch_size=tile_batch_size,
+                tile_grid_offset=seam_grid_offset,
+            )
+            seam_mask = seam_mask.to(device=samples.device, dtype=samples.dtype)
+            samples = torch.lerp(samples, refined_samples.to(dtype=samples.dtype), seam_mask)
+
     final_image = _restore_output_geometry(_samples_to_comfy_image(samples), latent_dict, handle)
     final_preview = None
     try:
@@ -2580,6 +2728,8 @@ def pid_ksampler(
     scheduler: str = "original",
     sde_noise_strength: float = 1.0,
     tiled_sde_noise_boost: float = 1.15,
+    seam_refine: bool = False,
+    seam_refine_strength: float = 0.25,
 ) -> torch.Tensor:
     try:
         if use_tiled:
@@ -2606,6 +2756,8 @@ def pid_ksampler(
                 scheduler=scheduler,
                 sde_noise_strength=sde_noise_strength,
                 tiled_sde_noise_boost=tiled_sde_noise_boost,
+                seam_refine=seam_refine,
+                seam_refine_strength=seam_refine_strength,
             )
 
         return decode_latent(
