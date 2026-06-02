@@ -65,7 +65,7 @@ class DummyModel:
             torch.ones((batch, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
         )
 
-    def _get_t_list(self, device, num_steps=None):
+    def _get_t_list(self, device, num_steps=None, scheduler=None):
         steps = num_steps or 4
         return torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
 
@@ -212,6 +212,7 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent=latent,
             prompt="cat",
+            negative_prompt="",
             cfg_scale=1.0,
             pid_inference_steps=4,
             seed=7,
@@ -233,6 +234,7 @@ class PiDRuntimeTests(unittest.TestCase):
                 handle=handle,
                 latent=latent,
                 prompt="cat",
+                negative_prompt="",
                 cfg_scale=1.0,
                 pid_inference_steps=4,
                 seed=0,
@@ -351,6 +353,7 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent=latent,
             prompt="cat",
+            negative_prompt="",
             cfg_scale=1.0,
             pid_inference_steps=4,
             seed=0,
@@ -367,6 +370,7 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
             prompt="cat",
+            negative_prompt="",
             cfg_scale=1.0,
             pid_inference_steps=4,
             seed=3,
@@ -378,7 +382,7 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertEqual(tuple(image.shape), (1, 128, 128, 3))
         self.assertTrue(torch.allclose(image, torch.ones_like(image)))
-        self.assertGreaterEqual(model.call_count, 9)
+        self.assertEqual(model.call_count, 36)
 
     def test_decode_latent_tiled_restores_original_output_geometry_after_encode_padding(self):
         model = DummyModel()
@@ -401,6 +405,7 @@ class PiDRuntimeTests(unittest.TestCase):
                 },
             },
             prompt="cat",
+            negative_prompt="",
             cfg_scale=1.0,
             pid_inference_steps=4,
             seed=3,
@@ -412,6 +417,61 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertEqual(tuple(image.shape), (1, 280, 380, 3))
 
+    def test_decode_latent_tiled_preserves_custom_rectangular_resolution(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+
+        image = pid_runtime.decode_latent_tiled(
+            handle=handle,
+            latent={"samples": torch.zeros((1, 16, 4, 6), dtype=torch.float32)},
+            prompt="cat",
+            negative_prompt="",
+            cfg_scale=1.0,
+            pid_inference_steps=4,
+            seed=3,
+            degrade_sigma=0.0,
+            tile_size=16,
+            tile_overlap=8,
+            tile_batch_size=1,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 128, 192, 3))
+        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (2, 2))
+
+    def test_decode_latent_tiled_applies_sde_noise_boost(self):
+        handle = self._register_runtime(DummyModel())
+        pid_prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM)),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="cat",
+        )
+
+        with (
+            mock.patch.object(pid_runtime, "_resolve_pid_prompt", return_value=pid_prompt),
+            mock.patch.object(
+                pid_runtime,
+                "_decode_samples",
+                return_value=torch.ones((1, 3, 1, 128, 128), dtype=torch.float32),
+            ) as patched_decode,
+        ):
+            pid_runtime.decode_latent_tiled(
+                handle=handle,
+                latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
+                prompt="cat",
+                negative_prompt="",
+                cfg_scale=1.0,
+                pid_inference_steps=4,
+                seed=3,
+                degrade_sigma=0.0,
+                tile_size=16,
+                tile_overlap=8,
+                tile_batch_size=1,
+                sde_noise_strength=1.0,
+                tiled_sde_noise_boost=1.35,
+            )
+
+        self.assertAlmostEqual(patched_decode.call_args.kwargs["sde_noise_strength"], 1.35)
+
     def test_decode_latent_tiled_batches_same_size_tiles(self):
         model = DummyModel()
         handle = self._register_runtime(model)
@@ -420,6 +480,7 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
             prompt="cat",
+            negative_prompt="",
             cfg_scale=1.0,
             pid_inference_steps=4,
             seed=3,
@@ -455,6 +516,7 @@ class PiDRuntimeTests(unittest.TestCase):
                 handle=handle,
                 latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
                 prompt="cat",
+                negative_prompt="",
                 cfg_scale=1.0,
                 pid_inference_steps=4,
                 seed=3,
@@ -470,7 +532,7 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["progress_advance"] > 0 for call in patched_decode.call_args_list))
         self.assertTrue(all(call.kwargs["step_preview_callback"] is not None for call in patched_decode.call_args_list))
         self.assertTrue(fake_progress.update.called)
-        self.assertTrue(all(call.kwargs["advance"] > 0 for call in fake_progress.update.call_args_list))
+        self.assertTrue(all(call.kwargs["advance"] > 0 for call in fake_progress.update.call_args_list[:-1]))
         self.assertTrue(all(call.kwargs["emit_bar"] for call in fake_progress.update.call_args_list))
 
     def test_decode_latent_tiled_updates_preview_for_each_composited_tile(self):
@@ -496,6 +558,7 @@ class PiDRuntimeTests(unittest.TestCase):
                 handle=handle,
                 latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
                 prompt="cat",
+                negative_prompt="",
                 cfg_scale=1.0,
                 pid_inference_steps=4,
                 seed=3,
@@ -531,6 +594,7 @@ class PiDRuntimeTests(unittest.TestCase):
                 handle=handle,
                 latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
                 prompt="cat",
+                negative_prompt="",
                 cfg_scale=1.0,
                 pid_inference_steps=4,
                 seed=3,
@@ -555,7 +619,7 @@ class PiDRuntimeTests(unittest.TestCase):
 
         with (
             mock.patch.object(pid_runtime.sys, "stderr", fake_stderr),
-            mock.patch.object(pid_runtime.time, "perf_counter", side_effect=[10.0, 10.0, 10.5, 11.0]),
+            mock.patch.object(pid_runtime.time, "perf_counter", side_effect=[10.0, 10.0, 11.0, 12.0]),
             mock.patch.dict(sys.modules, {"comfy.utils": fake_utils}),
         ):
             progress = pid_runtime._DecodeProgress(total=4)
@@ -571,7 +635,7 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertIn("00:01", output)
         self.assertIn("00:00", output)
         self.assertTrue(output.endswith("\n"))
-        fake_bar.update_absolute.assert_called_once_with(4, 4, None)
+        fake_bar.update_absolute.assert_has_calls([mock.call(0, 4), mock.call(4, 4, None)])
 
     def test_decode_progress_sends_legacy_preview_fallback(self):
         fake_bar = mock.Mock()
@@ -584,13 +648,135 @@ class PiDRuntimeTests(unittest.TestCase):
 
         with (
             mock.patch.dict(sys.modules, {"comfy.utils": fake_utils, "protocol": fake_protocol, "server": fake_server_module}),
-            mock.patch.object(pid_runtime.time, "perf_counter", side_effect=[10.0, 10.0]),
+            mock.patch.object(pid_runtime.time, "perf_counter", side_effect=[10.0, 10.0, 10.0, 10.0, 10.0]),
         ):
             progress = pid_runtime._DecodeProgress(total=4)
             preview = ("JPEG", object(), 512)
             progress.update(advance=1, preview=preview, emit_bar=True)
 
         fake_server_module.PromptServer.instance.send_sync.assert_called_once_with(2, preview, "cid")
+
+    def test_webp_preview_tuple_and_capped_size(self):
+        img = torch.ones((1, 3, 512, 512), dtype=torch.float32)
+        preview_fmt, preview_img, preview_sz = pid_runtime._make_preview_tuple(img)
+        self.assertEqual(preview_fmt, "WEBP")
+        self.assertLessEqual(preview_sz, 256)
+        self.assertLessEqual(preview_img.size[0], 256)
+        self.assertLessEqual(preview_img.size[1], 256)
+
+    def test_decode_samples_uses_deterministic_step_when_sde_noise_strength_is_zero(self):
+        class DeterministicModel:
+            def __init__(self):
+                self.config = types.SimpleNamespace(
+                    student_sample_steps=2,
+                    student_timestep=1.0,
+                    prediction_type="velocity",
+                )
+                self.fm_trainer = types.SimpleNamespace(timescale=1000.0)
+                self.autocast_dtype = None
+                self.net = mock.Mock()
+                self.net.eval = mock.Mock()
+                self.last_x = None
+
+            def predict_x0(self, x, sigma, caption_embs, attention_mask, lq_latent, degrade_sigma):
+                self.last_x = x.detach().clone()
+                return torch.zeros_like(x)
+
+            def _get_t_list(self, device, num_steps=None, scheduler="original"):
+                return torch.tensor([1.0, 0.5, 0.0], device=device, dtype=torch.float32)
+
+        model = DeterministicModel()
+        handle = self._register_runtime(model)
+        latent = torch.zeros((1, handle.latent_channels, 1, 1), dtype=torch.float32)
+        pid_prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM), dtype=torch.float32),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="",
+        )
+        initial_noise = torch.ones((1, 3, handle.latent_compression * handle.pid_scale, handle.latent_compression * handle.pid_scale))
+
+        samples = pid_runtime._decode_samples(
+            handle=handle,
+            latent_tensor=latent,
+            pid_prompt=pid_prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=2,
+            seed=0,
+            degrade_sigma=0.0,
+            noise=initial_noise.clone(),
+            scheduler="original",
+            sde_noise_strength=0.0,
+        )
+
+        expected_after_first_step = initial_noise + (0.5 - 1.0) * initial_noise
+        self.assertTrue(torch.allclose(model.last_x, expected_after_first_step, atol=1e-5))
+        self.assertTrue(torch.allclose(samples.squeeze(2), torch.zeros_like(samples.squeeze(2)), atol=1e-5))
+
+    def test_decode_samples_blends_low_sde_strength_with_deterministic_step(self):
+        class ConservativeModel:
+            def __init__(self):
+                self.config = types.SimpleNamespace(
+                    student_sample_steps=2,
+                    student_timestep=1.0,
+                    prediction_type="velocity",
+                )
+                self.fm_trainer = types.SimpleNamespace(timescale=1000.0)
+                self.autocast_dtype = None
+                self.net = mock.Mock()
+                self.net.eval = mock.Mock()
+                self.last_x = None
+
+            def predict_x0(self, x, sigma, caption_embs, attention_mask, lq_latent, degrade_sigma):
+                self.last_x = x.detach().clone()
+                return torch.zeros_like(x)
+
+            def _get_t_list(self, device, num_steps=None, scheduler="original"):
+                return torch.tensor([1.0, 0.5, 0.0], device=device, dtype=torch.float32)
+
+        model = ConservativeModel()
+        handle = self._register_runtime(model)
+        latent = torch.zeros((1, handle.latent_channels, 1, 1), dtype=torch.float32)
+        pid_prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM), dtype=torch.float32),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="",
+        )
+        initial_noise = torch.ones((1, 3, handle.latent_compression * handle.pid_scale, handle.latent_compression * handle.pid_scale))
+
+        pid_runtime._decode_samples(
+            handle=handle,
+            latent_tensor=latent,
+            pid_prompt=pid_prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=2,
+            seed=0,
+            degrade_sigma=0.0,
+            noise=initial_noise.clone(),
+            noise_list=[torch.zeros_like(initial_noise)],
+            scheduler="original",
+            sde_noise_strength=0.25,
+        )
+
+        expected_after_first_step = torch.full_like(initial_noise, 0.375)
+        self.assertTrue(torch.allclose(model.last_x, expected_after_first_step, atol=1e-5))
+
+    def test_native_lq_latent_process_in_unknown_backbone_is_identity(self):
+        fake_comfy = types.ModuleType("comfy")
+        fake_comfy_latent = types.ModuleType("comfy.latent_formats")
+        fake_comfy.latent_formats = fake_comfy_latent
+
+        with mock.patch.dict(sys.modules, {"comfy": fake_comfy, "comfy.latent_formats": fake_comfy_latent}):
+            test_tensor = torch.ones((1, 3, 32, 32))
+            res = pid_runtime._native_lq_latent_process_in("unknown", test_tensor)
+            self.assertTrue(torch.equal(res, test_tensor))
+
+    def test_removed_backbones_are_rejected(self):
+        for backbone in ("zimage", "dinov2", "siglip"):
+            with self.subTest(backbone=backbone):
+                with self.assertRaises(ValueError):
+                    pid_runtime._asset_patterns(backbone, "2k")
+                with self.assertRaises(ValueError):
+                    pid_runtime._instantiate_vae_encoder(backbone)
 
     def test_group_tile_jobs_by_decode_shape_batches_non_consecutive_matches(self):
         jobs = [
@@ -605,6 +791,18 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertEqual(grouped[0][0], jobs[0])
         self.assertEqual(grouped[0][1], jobs[2])
         self.assertEqual(grouped[1][0], jobs[1])
+
+    def test_group_tile_jobs_by_decode_window_reuses_identical_expanded_context(self):
+        jobs = [
+            pid_runtime._ExpandedTileDecodeJob(0, 0, 4, 4, 0, 0, 8, 8, 0, 0, 0, 0),
+            pid_runtime._ExpandedTileDecodeJob(0, 4, 4, 8, 0, 0, 8, 8, 0, 4, 0, 4),
+            pid_runtime._ExpandedTileDecodeJob(4, 0, 8, 4, 0, 0, 8, 8, 4, 0, 4, 0),
+        ]
+
+        grouped = pid_runtime._group_tile_jobs_by_decode_window(jobs)
+
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped[0], jobs)
 
     def test_small_tiled_decode_expands_context_window(self):
         base_job = pid_runtime._TileDecodeJob(start_y=32, start_x=32, end_y=64, end_x=64, out_y=1024, out_x=1024)
@@ -623,6 +821,43 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertEqual(expanded.crop_y, (base_job.start_y - expanded.decode_start_y) * 32)
         self.assertEqual(expanded.crop_x, (base_job.start_x - expanded.decode_start_x) * 32)
 
+    def test_small_tiled_decode_expands_context_window_flux2(self):
+        base_job = pid_runtime._TileDecodeJob(start_y=32, start_x=32, end_y=48, end_x=48, out_y=1024, out_x=1024)
+        expanded = pid_runtime._expand_tile_job(
+            job=base_job,
+            total_h=128,
+            total_w=128,
+            compression=16,
+            pid_scale=4,
+            min_size=1024,
+        )
+
+        self.assertEqual(expanded.decode_end_y - expanded.decode_start_y, 64)
+        self.assertEqual(expanded.decode_end_x - expanded.decode_start_x, 64)
+        self.assertEqual(expanded.crop_y, (base_job.start_y - expanded.decode_start_y) * 64)
+        self.assertEqual(expanded.crop_x, (base_job.start_x - expanded.decode_start_x) * 64)
+
+    def test_flux2_tiled_sampler_keeps_requested_inference_window(self):
+        model = DummyModel()
+        handle = self._register_runtime(model, backbone="flux2", latent_channels=128, latent_compression=16)
+
+        pid_runtime.decode_latent_tiled(
+            handle=handle,
+            latent={"samples": torch.zeros((1, 128, 48, 48), dtype=torch.float32)},
+            prompt="cat",
+            negative_prompt="",
+            cfg_scale=1.0,
+            pid_inference_steps=1,
+            seed=3,
+            degrade_sigma=0.0,
+            tile_size=512,
+            tile_overlap=64,
+            tile_batch_size=1,
+        )
+
+        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (32, 32))
+        self.assertEqual(model.call_count, 4)
+
     def test_decode_latent_tiled_validates_tile_alignment(self):
         handle = self._register_runtime(DummyModel(), backbone="flux2", latent_channels=128, latent_compression=16)
 
@@ -631,6 +866,7 @@ class PiDRuntimeTests(unittest.TestCase):
                 handle=handle,
                 latent={"samples": torch.zeros((1, 128, 4, 4), dtype=torch.float32)},
                 prompt="cat",
+                negative_prompt="",
                 cfg_scale=1.0,
                 pid_inference_steps=4,
                 seed=0,
@@ -648,6 +884,8 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
             prompt="cat",
+            negative_prompt="",
+            cfg_scale=5.0,
             pid_inference_steps=4,
             seed=0,
             degrade_sigma=0.0,
@@ -669,6 +907,8 @@ class PiDRuntimeTests(unittest.TestCase):
                 handle=handle,
                 latent={"samples": torch.zeros((1, 16, 2, 2), dtype=torch.float32)},
                 prompt="cat",
+                negative_prompt="",
+                cfg_scale=5.0,
                 pid_inference_steps=4,
                 seed=0,
                 degrade_sigma=0.0,
@@ -711,6 +951,8 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent=latent,
             prompt="cat",
+            negative_prompt="",
+            cfg_scale=1.0,
             pid_inference_steps=4,
             seed=0,
             degrade_sigma=0.0,
@@ -721,6 +963,8 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent=latent,
             prompt="dog",
+            negative_prompt="",
+            cfg_scale=1.0,
             pid_inference_steps=4,
             seed=0,
             degrade_sigma=0.0,
@@ -740,6 +984,8 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent=latent,
             prompt="cat",
+            negative_prompt="",
+            cfg_scale=1.0,
             pid_inference_steps=4,
             seed=0,
             degrade_sigma=0.0,
@@ -751,6 +997,8 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent=latent,
             prompt="dog",
+            negative_prompt="",
+            cfg_scale=1.0,
             pid_inference_steps=4,
             seed=0,
             degrade_sigma=0.0,
@@ -760,6 +1008,70 @@ class PiDRuntimeTests(unittest.TestCase):
         )
 
         self.assertFalse(torch.allclose(image_cat, image_dog))
+
+    def test_pid_ksampler_cfg_scale_changes_output_strength(self):
+        model = PromptAwareModel()
+        handle = self._register_runtime(model)
+        latent = {"samples": torch.zeros((1, 16, 2, 2), dtype=torch.float32)}
+
+        image_cfg_1 = pid_runtime.pid_ksampler(
+            handle=handle,
+            latent=latent,
+            prompt="cat",
+            negative_prompt="",
+            cfg_scale=1.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            keep_model_loaded_on_gpu=True,
+            use_tiled=False,
+        )
+        image_cfg_5 = pid_runtime.pid_ksampler(
+            handle=handle,
+            latent=latent,
+            prompt="cat",
+            negative_prompt="",
+            cfg_scale=5.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            keep_model_loaded_on_gpu=True,
+            use_tiled=False,
+        )
+
+        self.assertFalse(torch.allclose(image_cfg_1, image_cfg_5))
+
+    def test_pid_ksampler_negative_prompt_changes_output(self):
+        model = PromptAwareModel()
+        handle = self._register_runtime(model)
+        latent = {"samples": torch.zeros((1, 16, 2, 2), dtype=torch.float32)}
+
+        image_default_negative = pid_runtime.pid_ksampler(
+            handle=handle,
+            latent=latent,
+            prompt="cat",
+            negative_prompt="",
+            cfg_scale=5.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            keep_model_loaded_on_gpu=True,
+            use_tiled=False,
+        )
+        image_custom_negative = pid_runtime.pid_ksampler(
+            handle=handle,
+            latent=latent,
+            prompt="cat",
+            negative_prompt="blurry, low quality",
+            cfg_scale=5.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            keep_model_loaded_on_gpu=True,
+            use_tiled=False,
+        )
+
+        self.assertFalse(torch.allclose(image_default_negative, image_custom_negative))
 
     def test_encode_prompt_uses_external_clip_when_provided(self):
         model = DummyModel()
@@ -794,6 +1106,7 @@ class PiDRuntimeTests(unittest.TestCase):
             handle=handle,
             latent={"samples": torch.zeros((1, 16, 2, 2), dtype=torch.float32)},
             prompt="cat",
+            negative_prompt="",
             cfg_scale=1.0,
             pid_inference_steps=4,
             seed=0,
@@ -803,6 +1116,37 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertEqual(tuple(image.shape), (1, 64, 64, 3))
         self.assertTrue(torch.all(model.last_caption_embs == 3.0))
+
+    def test_get_t_list_linear_interpolation(self):
+        model = self._make_light_model()
+        model.config = types.SimpleNamespace(
+            student_timestep=1.0,
+            student_sample_steps=4,
+            student_t_list=[0.999, 0.866, 0.634, 0.342, 0.0]
+        )
+        t_list = model._get_t_list(device="cpu", num_steps=8, scheduler="original")
+        self.assertEqual(len(t_list), 9)
+        for i in range(len(t_list) - 1):
+            self.assertGreater(t_list[i].item(), t_list[i+1].item())
+        self.assertAlmostEqual(t_list[0].item(), 0.999)
+        self.assertAlmostEqual(t_list[-1].item(), 0.0)
+
+    def test_get_t_list_custom_schedulers(self):
+        model = self._make_light_model()
+        model.config = types.SimpleNamespace(
+            student_timestep=1.0,
+            student_sample_steps=4,
+            student_t_list=None
+        )
+        t_uniform = model._get_t_list(device="cpu", num_steps=4, scheduler="uniform")
+        self.assertTrue(torch.allclose(t_uniform, torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0])))
+        t_cosine = model._get_t_list(device="cpu", num_steps=4, scheduler="cosine")
+        self.assertAlmostEqual(t_cosine[0].item(), 1.0)
+        self.assertAlmostEqual(t_cosine[-1].item(), 0.0)
+        t_cosine_2 = model._get_t_list(device="cpu", num_steps=2, scheduler="cosine")
+        self.assertAlmostEqual(t_cosine_2[1].item(), 0.70710678, places=5)
+        t_quad = model._get_t_list(device="cpu", num_steps=4, scheduler="quadratic")
+        self.assertTrue(torch.allclose(t_quad, torch.tensor([1.0, 0.5625, 0.25, 0.0625, 0.0])))
 
     def test_light_model_prefers_native_text_encoder_loader(self):
         clip_text_encoder = DummyComfyClipTextEncoder()
@@ -1081,6 +1425,161 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(seen["lq_latent"], torch.full((1, 16, 2, 2), 3.0)))
 
+    def test_decode_samples_applies_lq_conditioning_boost_to_internal_sigma(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+        prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM), dtype=torch.float32),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="",
+        )
+
+        pid_runtime._decode_samples(
+            handle=handle,
+            latent_tensor=torch.zeros((1, handle.latent_channels, 1, 1), dtype=torch.float32),
+            pid_prompt=prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=1,
+            seed=0,
+            degrade_sigma=0.0,
+            lq_conditioning_boost=0.5,
+        )
+
+        self.assertTrue(torch.allclose(model.last_degrade_sigma, torch.tensor([-0.5])))
+
+    def test_decode_samples_source_denoise_zero_returns_resized_reference_without_prediction(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+        prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM), dtype=torch.float32),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="",
+        )
+        source = torch.full((1, 8, 8, 3), 0.75, dtype=torch.float32)
+
+        samples = pid_runtime._decode_samples(
+            handle=handle,
+            latent_tensor=torch.zeros((1, 16, 1, 1), dtype=torch.float32),
+            pid_prompt=prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            source_image=source,
+            source_denoise_strength=0.0,
+        )
+
+        self.assertEqual(model.call_count, 0)
+        self.assertTrue(torch.allclose(samples.squeeze(2), torch.full((1, 3, 32, 32), 0.5)))
+
+    def test_decode_samples_source_denoise_preserves_padded_source_aspect_ratio(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+        prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM), dtype=torch.float32),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="",
+        )
+        source = torch.tensor(
+            [[[[0.0, 0.0, 0.0]] * 4, [[1.0, 1.0, 1.0]] * 4]],
+            dtype=torch.float32,
+        )
+        geometry = {
+            "original_height": 2,
+            "original_width": 4,
+            "aligned_height": 4,
+            "aligned_width": 4,
+            "pad_top": 1,
+            "pad_bottom": 1,
+            "pad_left": 0,
+            "pad_right": 0,
+            "pid_scale": 4,
+        }
+
+        samples = pid_runtime._decode_samples(
+            handle=handle,
+            latent_tensor=torch.zeros((1, 16, 1, 1), dtype=torch.float32),
+            pid_prompt=prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            source_image=source,
+            source_geometry=geometry,
+            source_denoise_strength=0.0,
+        )
+
+        padded = pid_runtime._pad_image_tensor(source, geometry)
+        expected = torch.nn.functional.interpolate(
+            padded.permute(0, 3, 1, 2),
+            size=(32, 32),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).mul(2.0).sub(1.0)
+        self.assertTrue(torch.allclose(samples.squeeze(2), expected.clamp(-1, 1)))
+
+    def test_decode_samples_source_detail_noise_boost_increases_residual_sde_detail(self):
+        class SourceDetailModel(DummyModel):
+            def predict_x0(self, x, sigma, caption_embs, attention_mask, lq_latent, degrade_sigma):
+                self.call_count += 1
+                self.last_x = x.detach().clone()
+                return torch.zeros_like(x)
+
+        model = SourceDetailModel()
+        handle = self._register_runtime(model)
+        prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM), dtype=torch.float32),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="",
+        )
+        initial_noise = torch.ones((1, 3, 32, 32), dtype=torch.float32)
+
+        pid_runtime._decode_samples(
+            handle=handle,
+            latent_tensor=torch.zeros((1, 16, 1, 1), dtype=torch.float32),
+            pid_prompt=prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=2,
+            seed=0,
+            degrade_sigma=0.0,
+            source_image=torch.full((1, 8, 8, 3), 0.5, dtype=torch.float32),
+            source_denoise_strength=0.5,
+            source_detail_noise_boost=2.0,
+            sde_noise_strength=0.5,
+            noise=initial_noise,
+            noise_list=[initial_noise],
+        )
+
+        self.assertTrue(torch.allclose(model.last_x, torch.full_like(initial_noise, 0.375), atol=1e-5))
+
+    def test_decode_samples_tiled_sde_casts_float32_prediction_to_bfloat16_state(self):
+        model = DummyModel()
+        model.precision = torch.bfloat16
+        handle = self._register_runtime(model)
+        prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM), dtype=torch.float32),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="",
+        )
+
+        samples = pid_runtime._decode_samples(
+            handle=handle,
+            latent_tensor=torch.zeros((1, 16, 1, 1), dtype=torch.float32),
+            pid_prompt=prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=2,
+            seed=0,
+            degrade_sigma=0.0,
+            sde_noise_strength=0.5,
+            use_tiled=True,
+            tile_size=8,
+            tile_overlap=0,
+        )
+
+        self.assertEqual(samples.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(samples).all())
+
     def test_light_model_encodes_text_with_comfy_clip_text_encoder(self):
         clip_text_encoder = DummyComfyClipTextEncoder()
         model = self._make_light_model(text_encoder=clip_text_encoder)
@@ -1118,9 +1617,28 @@ class PiDNodeTests(unittest.TestCase):
         node = nodes.PiDDecodeLatent()
         sentinel = torch.zeros((1, 8, 8, 3))
         with mock.patch.object(nodes, "decode_latent", return_value=sentinel) as patched:
-            result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, "cat", 4, 1, 0.0)
+            result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, "cat", "bad", 5.0, 4, 1, 0.0, 0.0, 1.0, 1.0)
 
-        patched.assert_called_once()
+        patched.assert_called_once_with(
+            handle="model",
+            latent=mock.ANY,
+            prompt="cat",
+            negative_prompt="bad",
+            cfg_scale=5.0,
+            pid_inference_steps=4,
+            seed=1,
+            degrade_sigma=0.0,
+            lq_conditioning_boost=0.0,
+            source_denoise_strength=1.0,
+            source_detail_noise_boost=1.0,
+            source_image=None,
+            pid_prompt=None,
+            clip=None,
+            unique_id=None,
+            sampler="sde",
+            scheduler="original",
+            sde_noise_strength=1.0,
+        )
         self.assertEqual(result["result"], (sentinel,))
         self.assertEqual(result["ui"]["text"], ("8 x 8",))
 
@@ -1155,9 +1673,32 @@ class PiDNodeTests(unittest.TestCase):
         node = nodes.PiDDecodeLatentTiled()
         sentinel = torch.zeros((1, 64, 64, 3))
         with mock.patch.object(nodes, "decode_latent_tiled", return_value=sentinel) as patched:
-            result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, 256, 64, 2, "cat", 4, 1, 0.0)
+            result = node.decode("model", {"samples": torch.zeros((1, 16, 2, 2))}, 256, 64, 2, "cat", "bad", 5.0, 4, 1, 0.0, 0.0, 1.0, 1.0)
 
-        patched.assert_called_once()
+        patched.assert_called_once_with(
+            handle="model",
+            latent=mock.ANY,
+            tile_size=256,
+            tile_overlap=64,
+            tile_batch_size=2,
+            prompt="cat",
+            negative_prompt="bad",
+            cfg_scale=5.0,
+            pid_inference_steps=4,
+            seed=1,
+            degrade_sigma=0.0,
+            lq_conditioning_boost=0.0,
+            source_denoise_strength=1.0,
+            source_detail_noise_boost=1.0,
+            source_image=None,
+            pid_prompt=None,
+            clip=None,
+            unique_id=None,
+            sampler="sde",
+            scheduler="original",
+            sde_noise_strength=1.0,
+            tiled_sde_noise_boost=1.15,
+        )
         self.assertEqual(result["result"], (sentinel,))
         self.assertEqual(result["ui"]["text"], ("64 x 64",))
 
@@ -1165,11 +1706,78 @@ class PiDNodeTests(unittest.TestCase):
         node = nodes.PiDKSampler()
         sentinel = torch.zeros((1, 64, 64, 3))
         with mock.patch.object(nodes, "pid_ksampler", return_value=sentinel) as patched:
-            result = node.sample("model", {"samples": torch.zeros((1, 16, 2, 2))}, "cat", 4, 1, 0.0, True, True, 256, 64, 2)
+            result = node.sample("model", {"samples": torch.zeros((1, 16, 2, 2))}, "cat", "bad", 5.0, 4, 1, 0.0, 0.0, 1.0, 1.0, True, True, 256, 64, 2)
 
-        patched.assert_called_once()
+        patched.assert_called_once_with(
+            handle="model",
+            latent=mock.ANY,
+            prompt="cat",
+            negative_prompt="bad",
+            cfg_scale=5.0,
+            pid_inference_steps=4,
+            seed=1,
+            degrade_sigma=0.0,
+            lq_conditioning_boost=0.0,
+            source_denoise_strength=1.0,
+            source_detail_noise_boost=1.0,
+            source_image=None,
+            keep_model_loaded_on_gpu=True,
+            use_tiled=True,
+            tile_size=256,
+            tile_overlap=64,
+            tile_batch_size=2,
+            pid_prompt=None,
+            clip=None,
+            unique_id=None,
+            sampler="sde",
+            scheduler="original",
+            sde_noise_strength=1.0,
+            tiled_sde_noise_boost=1.15,
+        )
         self.assertEqual(result["result"], (sentinel,))
         self.assertEqual(result["ui"]["text"], ("64 x 64",))
+
+    def test_match_colors_adjusts_mean_and_std(self):
+        target = torch.ones((1, 16, 16, 3), dtype=torch.float32) * 0.2
+        reference = torch.ones((1, 16, 16, 3), dtype=torch.float32) * 0.8
+
+        matched = pid_runtime.match_colors(target, reference)
+
+        self.assertTrue(torch.allclose(matched, reference, atol=1e-3))
+
+    def test_resolve_reference_image_uses_latent_reference_when_input_is_disconnected(self):
+        reference = torch.rand((1, 8, 8, 3), dtype=torch.float32)
+        latent = {
+            "samples": torch.zeros((1, 16, 1, 1), dtype=torch.float32),
+            pid_runtime.LATENT_REFERENCE_IMAGE_KEY: reference,
+        }
+
+        resolved = pid_runtime.resolve_reference_image(latent)
+
+        self.assertTrue(torch.equal(resolved, reference))
+
+    def test_resolve_reference_image_prefers_explicit_input(self):
+        stored = torch.zeros((1, 8, 8, 3), dtype=torch.float32)
+        explicit = torch.ones((1, 8, 8, 3), dtype=torch.float32)
+        latent = {
+            "samples": torch.zeros((1, 16, 1, 1), dtype=torch.float32),
+            pid_runtime.LATENT_REFERENCE_IMAGE_KEY: stored,
+        }
+
+        resolved = pid_runtime.resolve_reference_image(latent, explicit)
+
+        self.assertTrue(torch.equal(resolved, explicit))
+
+    def test_match_colors_preserves_highlights(self):
+        # target has one pixel at 0.5 (mid) and one at 0.95 (highlight)
+        target = torch.tensor([[[[0.5, 0.5, 0.5], [0.95, 0.95, 0.95]]]], dtype=torch.float32)
+        # reference with high mean shifts target 0.95 beyond 1.0 without protection
+        reference = torch.tensor([[[[0.8, 0.8, 0.8], [0.99, 0.99, 0.99]]]], dtype=torch.float32)
+
+        matched = pid_runtime.match_colors(target, reference)
+
+        # Verify that the highlight pixel is protected from blowout and remains strictly < 1.0
+        self.assertLess(matched[0, 0, 1, 0].item(), 1.0)
 
 
 if __name__ == "__main__":

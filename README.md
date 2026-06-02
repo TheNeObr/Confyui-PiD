@@ -50,6 +50,35 @@ Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, with
   - In tiled mode, shows an incremental low-resolution preview during tile restoration and replaces it with the final blended composition when done.
   - Output: `IMAGE`.
 
+## Schedulers and Noise Control
+
+### SDE Sampler
+The node uses a stochastic sampler (SDE) by default. Since the distilled DMD2 checkpoints are trained strictly under SDE assumptions, the deterministic ODE sampler has been removed to avoid generating noisy, destroyed images.
+
+### Scheduler Options
+- **`original`**: The default non-linear timestep list from the loaded student model (traditionally optimized for 4 steps). When running with custom step counts, the node uses linear interpolation over the original schedule rather than rounding indices, preventing duplicate or wasted timesteps.
+- **`uniform`**: A linear schedule where timesteps are spaced evenly from the maximum student timestep down to `0.0`.
+- **`cosine`**: A schedule based on a cosine curve. It progresses faster in early timesteps and slows down at the end, giving the model more steps to refine details near the target output.
+- **`quadratic`**: A quadratic decay curve. Timesteps drop quickly at the beginning and slowly decrease towards the end of the sampling path.
+
+### SDE Noise Strength (`sde_noise_strength`)
+- A float slider from `0.0` to `1.0` that interpolates between the conservative deterministic path and full SDE sampling. Lower values now preserve more of the source trajectory instead of replacing it with a weak random color field.
+  - **`1.0`**: Full SDE noise injection (default).
+  - **`0.0`**: Uses a deterministic update for the intermediate steps instead of injecting random noise. This should reduce extra micro-detail and keep the decode more conservative, not produce a random color field.
+  - **`0.1` - `0.5`**: Keeps most of the deterministic update while blending in a small amount of SDE variation for subtle restoration.
+
+### Tiled SDE Noise Boost (`tiled_sde_noise_boost`)
+- Applied only when tiled sampling is active. The default `1.15` compensates for the more conservative local tile context without changing direct decoding.
+- Increase gradually toward `1.30` or `1.50` when tiled restoration preserves too much of the input. Values above `1.50` may introduce grain or seams.
+
+### Restoration Control
+- `restoration_strength` was removed because it blended the generated RGB output with the source after sampling. When reconstruction geometry differed, that post-process produced shadows and duplicated edges.
+- Use `degrade_sigma` for the model's internal LQ conditioning gate. `0.0` keeps the strongest source conditioning; larger values progressively reduce that conditioning and allow a freer reconstruction.
+- Use `lq_conditioning_boost` when `degrade_sigma = 0.0` is still too transformative. It increases source preservation inside the same trained LQ gate before prediction. Start at `0.25`, then try `0.50`; values above `1.0` are intentionally aggressive extrapolation.
+- Use `source_denoise_strength` for img2img-style restoration strength inside the sampler. `1.0` starts from full noise as before; lower values start closer to the resized source image and process a shorter noise range. `0.0` returns the resized source without generative reconstruction.
+- Use `source_detail_noise_boost` to recover texture while keeping a low `source_denoise_strength`. It scales only the residual SDE detail noise after source init. Start at `1.0`, then try `1.25` to `1.75`; reduce it when grain or color artifacts appear.
+- Use `sde_noise_strength` for sampling freedom. Lower values keep the trajectory more conservative without compositing two different RGB images.
+
 ## Recommended Flow
 
 1. Load the model with `PiD Load Model`.
@@ -118,6 +147,7 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 - The automatic encode correction now uses alignment-safe central padding instead of destructive crop-down sizing, which avoids output shift in image comparisons.
 - The latent produced by `PiD Encode Image` stores the original geometry and decode nodes crop the final result back to the original framing automatically for a more pixel-perfect comparison workflow.
 - `PiD Encode Image` includes optional tiled encode modes (`512` and `1024`) to reduce VRAM spikes during latent creation.
+- Custom rectangular latent resolutions stay rectangular during decode instead of being expanded to a square canvas.
 - Development and validation for this custom node were tested on an NVIDIA RTX 3090.
 - The recommended minimum GPU memory for practical use is 16 GB of VRAM.
 - Environments with 12 GB or 8 GB of VRAM were not tested, but they may still work depending on the workflow and settings used.
@@ -129,7 +159,8 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 - `PiD KSampler` now prints CLI progress with `current/total`, percent, `it/s`, and ETA.
 - Tiled preview stays in the preview size configured by ComfyUI, updates incrementally during restoration, and publishes a final blended preview at the end.
 - The decode node shows only `height x width` in a compact read-only `resolution` field below the preview, without creating extra graph outputs.
-- Small tiles such as `256` are decoded with extra internal context before the final crop to reduce green tint and color collapse.
+- In tiled sampling, `tile_size` is the effective inference-window limit. A requested `512` tile is processed as a `512` tile instead of being silently expanded to a larger direct-decode window.
+- Tiled sampling keeps the full-frame diffusion state and blend accumulators in system RAM, transferring only the active tile window to CUDA to prevent VRAM usage from scaling with the complete output canvas.
 - Green artifacts can also appear in non-tiled decoding when aspect-ratio changes or custom resolutions push the latent outside the model's most stable size/alignment range. This is not limited to `4:3`; the bigger issue is usually latent/grid alignment and using a checkpoint variant outside the resolution range where it is most stable.
 - As a practical rule, `2k` is usually the safer choice around a `512` base workflow, while `2kto4k` is usually the safer choice around a `1024` base workflow.
 - Using the `2k` checkpoint variant with `1024` in direct non-tiled decoding can still be accepted by the model, but it is more likely to produce green artifacts, color collapse, or unstable results than the same workflow at `512`.

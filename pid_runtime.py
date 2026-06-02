@@ -34,8 +34,9 @@ MAX_PROMPT_CACHE_ITEMS = 8
 AUTOENCODE_TILE_OVERLAP = {"flux": 128, "sd3": 128, "flux2": 128}
 # Tiles muito pequenos tendem a colapsar a cor no PiD; decodificamos com contexto maior
 # e recortamos o centro para manter a saida pedida sem o desvio verde.
-MIN_TILED_DECODE_SIZE = 512
+MIN_TILED_DECODE_SIZE = {"flux": 512, "sd3": 512, "flux2": 1024}
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
+LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
 _HANDLE_CACHE: dict[tuple[str, str], "PiDHandle"] = {}
 _PROMPT_CACHE: "OrderedDict[tuple[str, str, str], PiDPrompt]" = OrderedDict()
@@ -237,18 +238,46 @@ class _LightPiDModel:
     def _velocity_to_x0(self, x_t: torch.Tensor, net_output: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return self._net_output_to_x0(x_t, net_output, t, self.config.prediction_type)
 
-    def _get_t_list(self, device, num_steps: int | None = None) -> torch.Tensor:
+    def _get_t_list(self, device, num_steps: int | None = None, scheduler: str = "original") -> torch.Tensor:
         target_steps = num_steps if num_steps is not None else self.config.student_sample_steps
-        if self.config.student_t_list is not None:
+        student_timestep = float(self.config.student_timestep)
+        if scheduler == "original" and self.config.student_t_list is not None:
             full_t = torch.tensor(self.config.student_t_list, device=device, dtype=torch.float32)
             if target_steps != self.config.student_sample_steps:
-                indices = torch.linspace(0, len(full_t) - 1, target_steps + 1, device=device).round().long()
-                t_list = full_t[indices]
+                import math
+                t_list = torch.zeros(target_steps + 1, device=device, dtype=torch.float32)
+                for i in range(target_steps + 1):
+                    val = (i / target_steps) * (len(full_t) - 1)
+                    idx_l = int(math.floor(val))
+                    idx_h = int(math.ceil(val))
+                    weight = val - idx_l
+                    t_list[i] = (1.0 - weight) * full_t[idx_l] + weight * full_t[idx_h]
             else:
                 t_list = full_t
+        elif scheduler == "uniform":
+            t_list = torch.linspace(
+                student_timestep,
+                0.0,
+                target_steps + 1,
+                device=device,
+                dtype=torch.float32,
+            )
+        elif scheduler == "cosine":
+            import math
+            t_list = []
+            for i in range(target_steps + 1):
+                t = student_timestep * math.cos((i / target_steps) * (math.pi / 2))
+                t_list.append(t)
+            t_list = torch.tensor(t_list, device=device, dtype=torch.float32)
+        elif scheduler == "quadratic":
+            t_list = []
+            for i in range(target_steps + 1):
+                t = student_timestep * (1.0 - (i / target_steps))**2
+                t_list.append(t)
+            t_list = torch.tensor(t_list, device=device, dtype=torch.float32)
         else:
             t_list = torch.linspace(
-                self.config.student_timestep,
+                student_timestep,
                 0.0,
                 target_steps + 1,
                 device=device,
@@ -454,19 +483,27 @@ def _pushd(path: Path):
         os.chdir(old_cwd)
 
 
+def _canonical_backbone(backbone: str) -> str:
+    return backbone
+
+
+def _validate_backbone_variant(backbone: str, ckpt_type: str) -> None:
+    if ckpt_type not in SUPPORTED_VARIANTS:
+        raise ValueError(f"Unsupported PiD variant '{ckpt_type}' for backbone '{backbone}'. Valid: {SUPPORTED_VARIANTS}")
+
+
 def _asset_patterns(backbone: str, ckpt_type: str) -> list[str]:
     if backbone not in SUPPORTED_BACKBONES:
         raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
-    if ckpt_type not in SUPPORTED_VARIANTS:
-        raise ValueError(f"Unsupported PiD variant: {ckpt_type!r}")
-
+    _validate_backbone_variant(backbone, ckpt_type)
     if backbone == "flux":
-        vae_patterns = ["checkpoints/ae.safetensors"]
+        extra_patterns = ["checkpoints/ae.safetensors"]
     elif backbone == "sd3":
-        vae_patterns = ["checkpoints/sd3_vae/*"]
+        extra_patterns = ["checkpoints/sd3_vae/*"]
+    elif backbone == "flux2":
+        extra_patterns = ["checkpoints/flux2_ae.safetensors"]
     else:
-        vae_patterns = ["checkpoints/flux2_ae.safetensors"]
-
+        extra_patterns = []
     ckpt_name = {
         ("flux", "2k"): "PiD_res2k_sr4x_official_flux_distill_4step",
         ("flux", "2kto4k"): "PiD_res2kto4k_sr4x_official_flux_distill_4step",
@@ -475,21 +512,21 @@ def _asset_patterns(backbone: str, ckpt_type: str) -> list[str]:
         ("flux2", "2k"): "PiD_res2k_sr4x_official_flux2_distill_4step",
         ("flux2", "2kto4k"): "PiD_res2kto4k_sr4x_official_flux2_distill_4step",
     }[(backbone, ckpt_type)]
-
-    return [f"checkpoints/{ckpt_name}/*", *vae_patterns]
+    return [f"checkpoints/{ckpt_name}/*", *extra_patterns]
 
 
 def _tokenizer_overrides(backbone: str) -> list[str]:
+    backbone = _canonical_backbone(backbone)
     if backbone == "flux":
         vae_path = UPSTREAM_ROOT / "checkpoints" / "ae.safetensors"
-    elif backbone == "sd3":
+        return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
+    if backbone == "sd3":
         vae_path = UPSTREAM_ROOT / "checkpoints" / "sd3_vae" / "vae" / "diffusion_pytorch_model.safetensors"
-    elif backbone == "flux2":
+        return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
+    if backbone == "flux2":
         vae_path = UPSTREAM_ROOT / "checkpoints" / "flux2_ae.safetensors"
-    else:
-        raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
-
-    return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
+        return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
+    return []
 
 
 def _native_chi_prompt() -> str:
@@ -531,22 +568,16 @@ def _native_pid_config(backbone: str) -> _LightPiDConfig:
 def _instantiate_vae_encoder(backbone: str, tokenizer_config: Any = None) -> Any:
     if tokenizer_config is not None:
         from pid._ext.imaginaire.lazy_config import instantiate as lazy_instantiate
-
-        return lazy_instantiate(tokenizer_config)
-
+        with _pushd(UPSTREAM_ROOT):
+            return lazy_instantiate(tokenizer_config)
     if backbone == "flux":
         from pid._src.tokenizers.flux_vae import FluxVAEInterface
-
         return FluxVAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "ae.safetensors").as_posix())
     if backbone == "sd3":
         from pid._src.tokenizers.flux_vae import SD3VAEInterface
-
-        return SD3VAEInterface(
-            vae_pth=(UPSTREAM_ROOT / "checkpoints" / "sd3_vae" / "vae" / "diffusion_pytorch_model.safetensors").as_posix()
-        )
+        return SD3VAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "sd3_vae" / "vae" / "diffusion_pytorch_model.safetensors").as_posix())
     if backbone == "flux2":
         from pid._src.tokenizers.flux2_vae import Flux2VAEInterface
-
         return Flux2VAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "flux2_ae.safetensors").as_posix())
     raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
 
@@ -638,14 +669,13 @@ def _patch_native_pid_attention_dtype_mismatch() -> None:
 
 def _native_lq_latent_process_in(backbone: str, latent: torch.Tensor) -> torch.Tensor:
     import comfy.latent_formats
-
     if backbone == "flux":
         return comfy.latent_formats.Flux().process_in(latent)
     if backbone == "sd3":
         return comfy.latent_formats.SD3().process_in(latent)
     if backbone == "flux2":
         return comfy.latent_formats.Flux2().process_in(latent)
-    raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
+    return latent
 
 
 def _is_comfy_clip_text_encoder(text_encoder: Any) -> bool:
@@ -770,35 +800,33 @@ def _ensure_assets(backbone: str, ckpt_type: str) -> None:
 
     from huggingface_hub import snapshot_download
 
-    snapshot_download(
-        repo_id=HF_REPO_ID,
-        local_dir=str(UPSTREAM_ROOT),
-        allow_patterns=patterns,
-    )
+    try:
+        snapshot_download(
+            repo_id=HF_REPO_ID,
+            local_dir=str(UPSTREAM_ROOT),
+            allow_patterns=patterns,
+        )
+    except Exception as e:
+        print(f"[Warning] PiD: Falha ao baixar assets para '{backbone}' do HF (pode ser offline ou modelo customizado): {e}")
 
 
 def _prepare_handle(backbone: str, ckpt_type: str) -> PiDHandle:
     if backbone not in SUPPORTED_BACKBONES:
         raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
-    if ckpt_type not in SUPPORTED_VARIANTS:
-        raise ValueError(f"Unsupported PiD variant: {ckpt_type!r}")
-
+    _validate_backbone_variant(backbone, ckpt_type)
     cache_key = (backbone, ckpt_type)
     cached_handle = _HANDLE_CACHE.get(cache_key)
     if cached_handle is not None:
         return cached_handle
-
     _ensure_upstream_path()
     _ensure_assets(backbone, ckpt_type)
-
     from pid._src.inference.checkpoint_registry import get_pid_checkpoint
-
-    pid_checkpoint = get_pid_checkpoint(backbone, ckpt_type)
+    pid_checkpoint = get_pid_checkpoint(_canonical_backbone(backbone), ckpt_type)
     checkpoint_path = (UPSTREAM_ROOT / pid_checkpoint.checkpoint_path).resolve()
     handle = PiDHandle(
         backbone=backbone,
         ckpt_type=ckpt_type,
-        pid_scale=4,
+        pid_scale=pid_checkpoint.pid_scale,
         latent_channels=LATENT_CHANNELS[backbone],
         latent_compression=LATENT_COMPRESSION[backbone],
         input_caption_key="caption",
@@ -1006,7 +1034,7 @@ def _load_runtime(backbone: str, ckpt_type: str) -> tuple[PiDHandle, Any]:
     checkpoint_path = Path(handle.checkpoint_path)
     _ensure_upstream_path()
     from pid._src.inference.checkpoint_registry import get_pid_checkpoint
-    pid_checkpoint = get_pid_checkpoint(backbone, ckpt_type)
+    pid_checkpoint = get_pid_checkpoint(_canonical_backbone(backbone), ckpt_type)
     from pid._src.utils.model_loader import load_model_from_checkpoint
 
     with _pushd(UPSTREAM_ROOT):
@@ -1122,6 +1150,20 @@ def _encode_prompt_once(handle: PiDHandle, prompt: str, clip: Any = None) -> PiD
     while len(_PROMPT_CACHE) > MAX_PROMPT_CACHE_ITEMS:
         _PROMPT_CACHE.popitem(last=False)
     return prompt_value
+
+
+def _get_cfg_negative_prompt(handle: PiDHandle, negative_prompt: str | None = None) -> str:
+    if negative_prompt is not None and str(negative_prompt).strip():
+        return str(negative_prompt)
+    try:
+        model = _get_model(handle)
+    except Exception:
+        return ""
+    return str(getattr(getattr(model, "config", None), "negative_prompt", "") or "")
+
+
+def _resolve_uncond_pid_prompt(handle: PiDHandle, negative_prompt: str | None = None, clip: Any = None) -> PiDPrompt:
+    return _encode_prompt_once(handle, _get_cfg_negative_prompt(handle, negative_prompt), clip=clip)
 
 
 def encode_prompt(handle: PiDHandle, prompt: str, clip: Any = None) -> dict[str, torch.Tensor | str]:
@@ -1269,10 +1311,12 @@ def _autocorrect_encode_image_tensor(handle: PiDHandle, image_tensor: torch.Tens
 def _get_preview_size() -> int:
     try:
         from comfy.cli_args import args
-
-        return int(getattr(args, "preview_size", 512))
+        val = getattr(args, "preview_size", 256)
+        if val is None or not isinstance(val, (int, float)) or val <= 0:
+            return 256
+        return min(256, int(val))
     except Exception:
-        return 512
+        return 256
 
 
 def _get_preview_dimensions(height: int, width: int) -> tuple[int, int]:
@@ -1294,7 +1338,7 @@ def _make_preview_tuple(image: torch.Tensor):
             )
 
     arr = (preview_tensor[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype("uint8")
-    return ("JPEG", Image.fromarray(arr), _get_preview_size())
+    return ("WEBP", Image.fromarray(arr), _get_preview_size())
 
 
 def _make_tiled_composed_preview(output: torch.Tensor, weight_sum: torch.Tensor):
@@ -1409,7 +1453,10 @@ def encode_image_to_latent(
             f"mas o modelo espera {handle.latent_channels}."
         )
 
-    latent_dict: dict[str, Any] = {"samples": latent.float().cpu()}
+    latent_dict: dict[str, Any] = {
+        "samples": latent.float().cpu(),
+        LATENT_REFERENCE_IMAGE_KEY: source_image.float().cpu(),
+    }
     if image_geometry is not None:
         latent_dict[LATENT_IMAGE_GEOMETRY_KEY] = dict(image_geometry)
     return latent_dict
@@ -1428,7 +1475,8 @@ def _latent_tile_weight_mask(
     return _tile_weight_mask(
         height=height,
         width=width,
-        overlap=overlap,
+        overlap_y=overlap,
+        overlap_x=overlap,
         top_edge=top_edge,
         bottom_edge=bottom_edge,
         left_edge=left_edge,
@@ -1610,6 +1658,34 @@ def _repeat_pid_prompt(pid_prompt: PiDPrompt, repeat_blocks: int, base_batch: in
     return PiDPrompt(caption_embs=caption_embs, attention_mask=attention_mask, prompt=pid_prompt.prompt)
 
 
+def _repeat_pid_prompt_tensor(tensor: torch.Tensor, repeat_blocks: int, base_batch: int) -> torch.Tensor:
+    if tensor is None:
+        return None
+    if repeat_blocks <= 1:
+        return tensor
+    prompt_batch = int(tensor.shape[0])
+    target_batch = base_batch * repeat_blocks
+    if prompt_batch == 1:
+        return tensor.expand(target_batch, -1, -1).contiguous()
+    elif prompt_batch == base_batch:
+        return tensor.repeat((repeat_blocks, 1, 1)).contiguous()
+    return tensor
+
+
+def _repeat_attention_mask_tensor(tensor: torch.Tensor, repeat_blocks: int, base_batch: int) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if repeat_blocks <= 1:
+        return tensor
+    prompt_batch = int(tensor.shape[0])
+    target_batch = base_batch * repeat_blocks
+    if prompt_batch == 1:
+        return tensor.expand(target_batch, -1).contiguous()
+    elif prompt_batch == base_batch:
+        return tensor.repeat((repeat_blocks, 1)).contiguous()
+    return tensor
+
+
 def _make_decode_noise(
     batch_size: int,
     output_h: int,
@@ -1676,8 +1752,9 @@ def _expand_tile_job(
     total_w: int,
     compression: int,
     pid_scale: int,
+    min_size: int = 512,
 ) -> _ExpandedTileDecodeJob:
-    min_decode_latent = max(1, MIN_TILED_DECODE_SIZE // compression)
+    min_decode_latent = max(1, min_size // compression)
     decode_start_y, decode_end_y = _expand_tile_axis(job.start_y, job.end_y, total_h, min_decode_latent)
     decode_start_x, decode_end_x = _expand_tile_axis(job.start_x, job.end_x, total_w, min_decode_latent)
 
@@ -1708,11 +1785,25 @@ def _decode_samples(
     pid_inference_steps: int,
     seed: int,
     degrade_sigma: float,
+    lq_conditioning_boost: float = 0.0,
+    source_image: Any = None,
+    source_geometry: dict[str, int] | None = None,
+    source_denoise_strength: float = 1.0,
+    source_detail_noise_boost: float = 1.0,
+    uncond_pid_prompt: PiDPrompt | None = None,
     progress: _DecodeProgress | None = None,
     preview_enabled: bool = False,
     noise: torch.Tensor | None = None,
     progress_advance: int = 1,
     step_preview_callback: Any = None,
+    sampler: str = "sde",
+    scheduler: str = "original",
+    sde_noise_strength: float = 1.0,
+    noise_list: list[torch.Tensor] | None = None,
+    use_tiled: bool = False,
+    tile_size: int = 256,
+    tile_overlap: int = 64,
+    tile_batch_size: int = 1,
 ) -> torch.Tensor:
     if latent_tensor.shape[1] != handle.latent_channels:
         raise ValueError(
@@ -1732,6 +1823,8 @@ def _decode_samples(
 
     precision = _get_execution_dtype(model)
     _set_runtime_net_device(model, device, precision=precision)
+    cfg_scale = float(cfg_scale)
+    use_cfg = abs(cfg_scale - 1.0) > 1e-6 and uncond_pid_prompt is not None
     caption_embs = pid_prompt.caption_embs
     attention_mask = pid_prompt.attention_mask
     _validate_pid_prompt_tensors(caption_embs, attention_mask, prompt_source="O condicionamento PiD")
@@ -1745,103 +1838,398 @@ def _decode_samples(
     caption_embs = caption_embs.to(device=device, dtype=precision)
     if attention_mask is not None:
         attention_mask = attention_mask.to(device=device, dtype=torch.int64)
-    latent_state = latent_tensor.to(device=device, dtype=precision)
+    uncond_caption_embs = None
+    uncond_attention_mask = None
+    if use_cfg:
+        uncond_caption_embs = uncond_pid_prompt.caption_embs
+        uncond_attention_mask = uncond_pid_prompt.attention_mask
+        _validate_pid_prompt_tensors(uncond_caption_embs, uncond_attention_mask, prompt_source="O prompt negativo do CFG")
+        if uncond_caption_embs.shape[0] == 1 and batch_size > 1:
+            uncond_caption_embs = uncond_caption_embs.expand(batch_size, -1, -1)
+        elif uncond_caption_embs.shape[0] != batch_size:
+            raise ValueError(
+                f"prompt negativo do CFG precisa ter batch 1 ou {batch_size}, mas recebeu {uncond_caption_embs.shape[0]}."
+            )
+        uncond_caption_embs = uncond_caption_embs.to(device=device, dtype=precision)
+        if uncond_attention_mask is not None:
+            uncond_attention_mask = uncond_attention_mask.to(device=device, dtype=torch.int64)
+    state_device = torch.device("cpu") if use_tiled else torch.device(device)
+    latent_state = latent_tensor.to(device=state_device, dtype=precision)
     if hasattr(model, "base_model"):
         latent_state = _native_lq_latent_process_in(handle.backbone, latent_state)
-    sigma_tensor = torch.full((batch_size,), float(degrade_sigma), device=device, dtype=torch.float32)
+    effective_degrade_sigma = float(degrade_sigma) - max(0.0, float(lq_conditioning_boost))
+    sigma_tensor = torch.full((batch_size,), effective_degrade_sigma, device=device, dtype=torch.float32)
 
-    gen = torch.Generator(device=device).manual_seed(int(seed))
+    gen = torch.Generator(device=state_device).manual_seed(int(seed))
     if noise is None:
-        noise = torch.randn((batch_size, 3, output_h, output_w), device=device, dtype=precision, generator=gen)
+        noise = torch.randn((batch_size, 3, output_h, output_w), device=state_device, dtype=precision, generator=gen)
     else:
         expected_shape = (batch_size, 3, output_h, output_w)
         if tuple(noise.shape) != expected_shape:
             raise ValueError(f"Ruido inicial invalido para PiD: esperado {expected_shape}, recebido {tuple(noise.shape)}.")
-        noise = noise.to(device=device, dtype=precision)
+        noise = noise.to(device=state_device, dtype=precision)
+    source_state = None
+    source_denoise_strength = max(0.0, min(1.0, float(source_denoise_strength)))
+    if source_image is not None and source_denoise_strength < 1.0:
+        source_state = _extract_image_tensor(source_image).to(device=state_device, dtype=torch.float32)
+        if source_state.shape[0] == 1 and batch_size > 1:
+            source_state = source_state.expand(batch_size, -1, -1, -1)
+        elif source_state.shape[0] != batch_size:
+            raise ValueError(
+                f"source_image precisa ter batch 1 ou {batch_size}, mas recebeu {source_state.shape[0]}."
+            )
+        if source_geometry is not None:
+            original_size = (
+                int(source_geometry.get("original_height", source_state.shape[1])),
+                int(source_geometry.get("original_width", source_state.shape[2])),
+            )
+            aligned_size = (
+                int(source_geometry.get("aligned_height", source_state.shape[1])),
+                int(source_geometry.get("aligned_width", source_state.shape[2])),
+            )
+            if tuple(source_state.shape[1:3]) == original_size:
+                source_state = _pad_image_tensor(source_state, source_geometry)
+            elif tuple(source_state.shape[1:3]) != aligned_size:
+                source_state = _center_crop_or_pad_image_tensor(source_state, *aligned_size)
+        source_state = F.interpolate(
+            source_state.permute(0, 3, 1, 2),
+            size=(output_h, output_w),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).clamp(0.0, 1.0)
+        source_state = source_state.mul(2.0).sub(1.0).to(dtype=precision)
     autocast_ctx = torch.autocast("cuda", dtype=model.autocast_dtype) if getattr(model, "autocast_dtype", None) else nullcontext()
     net = model.net
     net.eval()
 
+    if use_tiled:
+        compression = handle.latent_compression
+        tile_latent = tile_size // compression
+        overlap_latent = tile_overlap // compression
+        starts_y = _compute_tile_starts(int(latent_tensor.shape[-2]), tile_latent, overlap_latent)
+        starts_x = _compute_tile_starts(int(latent_tensor.shape[-1]), tile_latent, overlap_latent)
+        actual_overlap_y = (tile_latent - (starts_y[1] - starts_y[0])) * compression * handle.pid_scale if len(starts_y) > 1 else 0
+        actual_overlap_x = (tile_latent - (starts_x[1] - starts_x[0])) * compression * handle.pid_scale if len(starts_x) > 1 else 0
+
+        # The configured tile size is the VRAM contract for tiled sampling.
+        # Expanding FLUX2 tiles to its direct-decode minimum defeats tiling and
+        # can turn a requested 512 window back into a costly 1024 inference.
+        min_size = tile_size
+        tile_jobs = _iter_tile_jobs(latent_tensor, compression, handle.pid_scale, tile_latent, overlap_latent)
+        expanded_jobs = [
+            _expand_tile_job(
+                job=job,
+                total_h=int(latent_tensor.shape[-2]),
+                total_w=int(latent_tensor.shape[-1]),
+                compression=compression,
+                pid_scale=handle.pid_scale,
+                min_size=min_size,
+            )
+            for job in tile_jobs
+        ]
+        grouped_job_windows = _group_tile_job_windows_by_decode_shape(
+            _group_tile_jobs_by_decode_window(expanded_jobs)
+        )
+        unique_window_count = sum(len(group) for group in grouped_job_windows)
+        max_window_h = max(job.decode_end_y - job.decode_start_y for job in expanded_jobs) * compression
+        max_window_w = max(job.decode_end_x - job.decode_start_x for job in expanded_jobs) * compression
+        print(
+            f"PiD tiled plan: {len(tile_jobs)} tiles, {unique_window_count} unique windows, "
+            f"max inference window {max_window_w}x{max_window_h}, tile_batch_size={tile_batch_size}, "
+            "global state=cpu.",
+            flush=True,
+        )
+        weight_cache_cpu = {}
+
+    def _get_downsampled_preview(x0: torch.Tensor) -> torch.Tensor:
+        h, w = x0.shape[-2:]
+        preview_size = _get_preview_size()
+        stride = max(1, max(h, w) // preview_size)
+        x0_sliced = x0[:1, :, ::stride, ::stride]
+        x0_cpu = x0_sliced.to(device="cpu", dtype=torch.float32)
+        target_h, target_w = _get_preview_dimensions(h, w)
+        if (target_h, target_w) != tuple(x0_cpu.shape[-2:]):
+            x0_down = F.interpolate(
+                x0_cpu,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+                antialias=False,
+            )
+        else:
+            x0_down = x0_cpu
+        return (x0_down.clamp(-1, 1) * 0.5 + 0.5).clamp(0, 1)
+
     def _preview_tuple_from_x0(x0: torch.Tensor):
         if not preview_enabled:
             return None
-        image = (x0[:1].float().clamp(-1, 1) * 0.5 + 0.5).clamp(0, 1)
+        image = _get_downsampled_preview(x0)
         return _make_preview_tuple(image)
 
+    def _predict_x0_direct(x_in: torch.Tensor, t_batch: torch.Tensor, cond_embs: torch.Tensor, cond_mask: torch.Tensor | None) -> torch.Tensor:
+        return model.predict_x0(
+            x_in,
+            t_batch,
+            cond_embs,
+            cond_mask,
+            latent_state,
+            sigma_tensor,
+        )
+
+    def _predict_x0_cfg(x_in: torch.Tensor, t_batch: torch.Tensor) -> torch.Tensor:
+        x0_cond = _predict_x0_direct(x_in, t_batch, caption_embs, attention_mask)
+        if not use_cfg:
+            return x0_cond
+        x0_uncond = _predict_x0_direct(x_in, t_batch, uncond_caption_embs, uncond_attention_mask)
+        return x0_uncond + cfg_scale * (x0_cond - x0_uncond)
+
+    def _predict_velocity_direct(x_in: torch.Tensor, t_scaled: torch.Tensor, cond_embs: torch.Tensor) -> torch.Tensor:
+        return net(
+            x_in,
+            t_scaled,
+            cond_embs,
+            lq_video_or_image=None,
+            lq_latent=latent_state,
+            degrade_sigma=sigma_tensor,
+        )
+
+    def _predict_velocity_cfg(x_in: torch.Tensor, t_scaled: torch.Tensor) -> torch.Tensor:
+        v_cond = _predict_velocity_direct(x_in, t_scaled, caption_embs)
+        if not use_cfg:
+            return v_cond
+        v_uncond = _predict_velocity_direct(x_in, t_scaled, uncond_caption_embs)
+        return v_uncond + cfg_scale * (v_cond - v_uncond)
+
+    def _predict_x0_cfg_tiled(x_global: torch.Tensor, t_cur_batch: torch.Tensor) -> torch.Tensor:
+        x0_global_accum = torch.zeros_like(x_global, device="cpu", dtype=torch.float32)
+        weight_sum = torch.zeros((batch_size, 1, output_h, output_w), device="cpu", dtype=torch.float32)
+
+        for job_window_group in grouped_job_windows:
+            group_index = 0
+            while group_index < len(job_window_group):
+                job_window_batch = job_window_group[group_index : group_index + tile_batch_size]
+                group_index += len(job_window_batch)
+                representative_jobs = [job_window[0] for job_window in job_window_batch]
+
+                # Crop each unique expanded window once, then reuse its prediction
+                # for all target tiles that share that context.
+                x_batch = torch.cat(
+                    [
+                        x_global[
+                            :,
+                            :,
+                            job.decode_start_y * compression * handle.pid_scale : job.decode_end_y * compression * handle.pid_scale,
+                            job.decode_start_x * compression * handle.pid_scale : job.decode_end_x * compression * handle.pid_scale,
+                        ].contiguous()
+                        for job in representative_jobs
+                    ],
+                    dim=0,
+                ).to(device=device, dtype=precision)
+
+                latent_batch = torch.cat(
+                    [
+                        latent_state[:, :, job.decode_start_y : job.decode_end_y, job.decode_start_x : job.decode_end_x].contiguous()
+                        for job in representative_jobs
+                    ],
+                    dim=0,
+                ).to(device=device, dtype=precision)
+
+                batch_job_count = len(representative_jobs)
+                caption_embs_repeated = _repeat_pid_prompt_tensor(caption_embs, batch_job_count, batch_size)
+                attention_mask_repeated = _repeat_attention_mask_tensor(attention_mask, batch_job_count, batch_size)
+
+                t_cur_batch_repeated = t_cur_batch.repeat(batch_job_count)
+                sigma_tensor_repeated = sigma_tensor.repeat(batch_job_count)
+
+                if use_cfg:
+                    # Conditional pass
+                    if hasattr(model, "predict_x0"):
+                        x0_cond = model.predict_x0(
+                            x_batch,
+                            t_cur_batch_repeated,
+                            caption_embs_repeated,
+                            attention_mask_repeated,
+                            latent_batch,
+                            sigma_tensor_repeated,
+                        )
+                    else:
+                        t_cur_scaled = t_cur_batch_repeated * timescale
+                        v_cond = net(
+                            x_batch,
+                            t_cur_scaled,
+                            caption_embs_repeated,
+                            lq_video_or_image=None,
+                            lq_latent=latent_batch,
+                            degrade_sigma=sigma_tensor_repeated,
+                        )
+                        x0_cond = model._velocity_to_x0(x_batch, v_cond, t_cur_batch_repeated)
+
+                    # Unconditional pass
+                    uncond_caption_embs_repeated = _repeat_pid_prompt_tensor(uncond_caption_embs, batch_job_count, batch_size)
+                    uncond_attention_mask_repeated = _repeat_attention_mask_tensor(uncond_attention_mask, batch_job_count, batch_size)
+
+                    if hasattr(model, "predict_x0"):
+                        x0_uncond = model.predict_x0(
+                            x_batch,
+                            t_cur_batch_repeated,
+                            uncond_caption_embs_repeated,
+                            uncond_attention_mask_repeated,
+                            latent_batch,
+                            sigma_tensor_repeated,
+                        )
+                    else:
+                        t_cur_scaled = t_cur_batch_repeated * timescale
+                        v_uncond = net(
+                            x_batch,
+                            t_cur_scaled,
+                            uncond_caption_embs_repeated,
+                            lq_video_or_image=None,
+                            lq_latent=latent_batch,
+                            degrade_sigma=sigma_tensor_repeated,
+                        )
+                        x0_uncond = model._velocity_to_x0(x_batch, v_uncond, t_cur_batch_repeated)
+
+                    x0_batch = x0_uncond + cfg_scale * (x0_cond - x0_uncond)
+                else:
+                    if hasattr(model, "predict_x0"):
+                        x0_batch = model.predict_x0(
+                            x_batch,
+                            t_cur_batch_repeated,
+                            caption_embs_repeated,
+                            attention_mask_repeated,
+                            latent_batch,
+                            sigma_tensor_repeated,
+                        )
+                    else:
+                        t_cur_scaled = t_cur_batch_repeated * timescale
+                        v_batch = net(
+                            x_batch,
+                            t_cur_scaled,
+                            caption_embs_repeated,
+                            lq_video_or_image=None,
+                            lq_latent=latent_batch,
+                            degrade_sigma=sigma_tensor_repeated,
+                        )
+                        x0_batch = model._velocity_to_x0(x_batch, v_batch, t_cur_batch_repeated)
+
+                # Write the unique window prediction back to each target tile.
+                for offset, job_window in enumerate(job_window_batch):
+                    tile_x0 = x0_batch[offset * batch_size : (offset + 1) * batch_size].to(
+                        device="cpu",
+                        dtype=torch.float32,
+                    )
+                    for job in job_window:
+                        target_h = (job.target_end_y - job.target_start_y) * compression * handle.pid_scale
+                        target_w = (job.target_end_x - job.target_start_x) * compression * handle.pid_scale
+                        tile_x0_cropped = tile_x0[:, :, job.crop_y : job.crop_y + target_h, job.crop_x : job.crop_x + target_w]
+
+                        tile_h = int(tile_x0_cropped.shape[2])
+                        tile_w = int(tile_x0_cropped.shape[3])
+
+                        weight_key = (
+                            tile_h,
+                            tile_w,
+                            actual_overlap_y,
+                            actual_overlap_x,
+                            job.target_start_y == 0,
+                            job.target_end_y == int(latent_tensor.shape[-2]),
+                            job.target_start_x == 0,
+                            job.target_end_x == int(latent_tensor.shape[-1]),
+                        )
+                        weight = weight_cache_cpu.get(weight_key)
+                        if weight is None:
+                            weight = _tile_weight_mask(
+                                height=tile_h,
+                                width=tile_w,
+                                overlap_y=actual_overlap_y,
+                                overlap_x=actual_overlap_x,
+                                top_edge=weight_key[4],
+                                bottom_edge=weight_key[5],
+                                left_edge=weight_key[6],
+                                right_edge=weight_key[7],
+                                device=torch.device("cpu"),
+                            )
+                            weight_cache_cpu[weight_key] = weight
+
+                        weight_cf = weight.permute(0, 3, 1, 2)
+                        x0_global_accum[:, :, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w] += tile_x0_cropped * weight_cf
+                        weight_sum[:, :, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w] += weight_cf
+
+        return x0_global_accum / weight_sum.clamp_min(1e-6)
+
     with torch.inference_mode():
+        if source_state is not None and source_denoise_strength <= 1e-6:
+            return source_state.clamp(-1, 1).unsqueeze(2)
         effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else int(model.config.student_sample_steps)
-        student_sample_type = getattr(model.config, "student_sample_type", "sde")
+        student_sample_type = sampler
         prediction_type = getattr(model.config, "prediction_type", "velocity")
         student_timestep = float(getattr(model.config, "student_timestep", 1.0))
+        sde_noise_strength = max(0.0, float(sde_noise_strength))
+        deterministic_sde = sde_noise_strength <= 1e-6
+        sde_blend_strength = min(1.0, sde_noise_strength)
+        sde_noise_scale = max(1.0, sde_noise_strength)
+        if source_state is not None:
+            sde_noise_scale *= max(0.0, float(source_detail_noise_boost))
         if effective_steps == 1:
-            t_student = torch.full((batch_size,), student_timestep, device=device, dtype=torch.float32)
-            if hasattr(model, "predict_x0"):
-                x0_student = model.predict_x0(
-                    noise,
-                    t_student,
-                    caption_embs,
-                    attention_mask,
-                    latent_state,
-                    sigma_tensor,
-                )
+            effective_timestep = student_timestep * source_denoise_strength if source_state is not None else student_timestep
+            t_student = torch.full((batch_size,), effective_timestep, device=device, dtype=torch.float32)
+            if source_state is not None:
+                noise = (1.0 - effective_timestep) * source_state + effective_timestep * noise
+            if use_tiled:
+                x0_student = _predict_x0_cfg_tiled(noise, t_student)
             else:
-                t_student_scaled = t_student * model.fm_trainer.timescale
-                with autocast_ctx:
-                    v_student = net(
-                        noise,
-                        t_student_scaled,
-                        caption_embs,
-                        lq_video_or_image=None,
-                        lq_latent=latent_state,
-                        degrade_sigma=sigma_tensor,
-                    )
-                    x0_student = model._velocity_to_x0(noise, v_student, t_student)
-            if progress is not None:
-                preview_tuple = _preview_tuple_from_x0(x0_student)
-                if step_preview_callback is not None and preview_tuple is not None:
-                    step_preview_callback((x0_student.float().clamp(-1, 1) * 0.5 + 0.5).clamp(0, 1))
+                if hasattr(model, "predict_x0"):
+                    x0_student = _predict_x0_cfg(noise, t_student)
                 else:
+                    t_student_scaled = t_student * model.fm_trainer.timescale
+                    with autocast_ctx:
+                        v_student = _predict_velocity_cfg(noise, t_student_scaled)
+                        x0_student = model._velocity_to_x0(noise, v_student, t_student)
+            if progress is not None:
+                if step_preview_callback is not None:
+                    step_preview_callback(_get_downsampled_preview(x0_student))
+                else:
+                    preview_tuple = _preview_tuple_from_x0(x0_student)
                     progress.update(
                         advance=progress_advance,
                         preview=preview_tuple,
                         emit_bar=preview_enabled,
                     )
         else:
-            t_list = model._get_t_list(device=torch.device(device), num_steps=effective_steps)
-            x = noise
+            t_list = model._get_t_list(device=torch.device(device), num_steps=effective_steps, scheduler=scheduler)
+            if source_state is not None:
+                t_list = t_list * source_denoise_strength
+                initial_t = t_list[0].to(device=state_device, dtype=precision)
+                x = (1.0 - initial_t) * source_state + initial_t * noise
+            else:
+                x = noise
             timescale = model.fm_trainer.timescale
             with autocast_ctx:
-                for t_cur, t_next in zip(t_list[:-1], t_list[1:]):
+                for step_idx, (t_cur, t_next) in enumerate(zip(t_list[:-1], t_list[1:])):
                     t_cur_batch = t_cur.expand(batch_size)
-                    if hasattr(model, "predict_x0"):
-                        x0_pred = model.predict_x0(
-                            x,
-                            t_cur_batch,
-                            caption_embs,
-                            attention_mask,
-                            latent_state,
-                            sigma_tensor,
-                        )
+                    if use_tiled:
+                        x0_pred = _predict_x0_cfg_tiled(x, t_cur_batch)
                         t_shape = [batch_size] + [1] * (x.ndim - 1)
-                        v_pred = ((x.double() - x0_pred.double()) / t_cur_batch.double().view(*t_shape).clamp(min=5e-2)).to(x.dtype)
+                        t_cur_state = t_cur_batch.to(device=x.device, dtype=torch.float64)
+                        v_pred = ((x.double() - x0_pred.double()) / t_cur_state.view(*t_shape).clamp(min=5e-2)).to(x.dtype)
                     else:
-                        t_cur_scaled = t_cur_batch * timescale
-                        v_pred = net(
-                            x,
-                            t_cur_scaled,
-                            caption_embs,
-                            lq_video_or_image=None,
-                            lq_latent=latent_state,
-                            degrade_sigma=sigma_tensor,
-                        )
-                        x0_pred = model._velocity_to_x0(x, v_pred, t_cur_batch)
+                        if hasattr(model, "predict_x0"):
+                            x0_pred = _predict_x0_cfg(x, t_cur_batch)
+                            t_shape = [batch_size] + [1] * (x.ndim - 1)
+                            v_pred = ((x.double() - x0_pred.double()) / t_cur_batch.double().view(*t_shape).clamp(min=5e-2)).to(x.dtype)
+                        else:
+                            t_cur_scaled = t_cur_batch * timescale
+                            v_pred = _predict_velocity_cfg(x, t_cur_scaled)
+                            x0_pred = model._velocity_to_x0(x, v_pred, t_cur_batch)
 
                     if t_next.item() > 0:
-                        if student_sample_type == "ode":
-                            v_for_step = model._net_output_to_velocity(x, v_pred, t_cur_batch, prediction_type)
-                            dt = t_next - t_cur
-                            x = x + dt * v_for_step
-                            preview_x0 = x0_pred
+                        dt = (t_next - t_cur).to(device=x.device, dtype=x.dtype)
+                        x_deterministic = x + dt * v_pred
+                        if deterministic_sde:
+                            x = x_deterministic
+                        elif noise_list is not None and step_idx < len(noise_list):
+                            eps_infer = noise_list[step_idx].to(device=x0_pred.device, dtype=x0_pred.dtype)
                         else:
                             eps_infer = torch.randn(
                                 x0_pred.shape,
@@ -1849,19 +2237,22 @@ def _decode_samples(
                                 dtype=x0_pred.dtype,
                                 generator=gen,
                             )
+                        if not deterministic_sde:
                             s = [batch_size] + [1] * (x.ndim - 1)
-                            t_next_bcast = t_next.reshape(1).expand(s)
-                            x = (1.0 - t_next_bcast) * x0_pred + t_next_bcast * eps_infer
-                            preview_x0 = x0_pred
+                            t_next_bcast = t_next.to(device=x0_pred.device, dtype=x0_pred.dtype).reshape(1).expand(s)
+                            x_stochastic = (1.0 - t_next_bcast) * x0_pred + t_next_bcast * eps_infer * sde_noise_scale
+                            x_stochastic = x_stochastic.to(device=x_deterministic.device, dtype=x_deterministic.dtype)
+                            x = torch.lerp(x_deterministic, x_stochastic, sde_blend_strength)
+                        preview_x0 = x0_pred
                     else:
                         x = x0_pred
                         preview_x0 = x
 
                     if progress is not None:
-                        preview_tuple = _preview_tuple_from_x0(preview_x0)
-                        if step_preview_callback is not None and preview_tuple is not None:
-                            step_preview_callback((preview_x0.float().clamp(-1, 1) * 0.5 + 0.5).clamp(0, 1))
+                        if step_preview_callback is not None:
+                            step_preview_callback(_get_downsampled_preview(preview_x0))
                         else:
+                            preview_tuple = _preview_tuple_from_x0(preview_x0)
                             progress.update(
                                 advance=progress_advance,
                                 preview=preview_tuple,
@@ -1893,17 +2284,19 @@ def _compute_tile_starts(total: int, tile: int, overlap: int) -> list[int]:
     if total <= tile:
         return [0]
 
-    stride = tile - overlap
-    starts = list(range(0, total - tile + 1, stride))
-    if starts[-1] != total - tile:
-        starts.append(total - tile)
+    import math
+    N = int(math.ceil((total - overlap) / (tile - overlap)))
+    N = max(2, N)
+
+    starts = [int(round(i * (total - tile) / (N - 1))) for i in range(N)]
     return starts
 
 
 def _tile_weight_mask(
     height: int,
     width: int,
-    overlap: int,
+    overlap_y: int,
+    overlap_x: int,
     top_edge: bool,
     bottom_edge: bool,
     left_edge: bool,
@@ -1913,18 +2306,19 @@ def _tile_weight_mask(
     weight_y = torch.ones((height,), dtype=torch.float32, device=device)
     weight_x = torch.ones((width,), dtype=torch.float32, device=device)
 
-    if overlap > 0:
-        ramp_y = torch.linspace(1.0 / overlap, 1.0, overlap, dtype=torch.float32, device=device)
-        ramp_x = torch.linspace(1.0 / overlap, 1.0, overlap, dtype=torch.float32, device=device)
-
+    if overlap_y > 0:
+        ramp_y = torch.linspace(1.0 / overlap_y, 1.0, overlap_y, dtype=torch.float32, device=device)
         if not top_edge:
-            weight_y[:overlap] = torch.minimum(weight_y[:overlap], ramp_y)
+            weight_y[:overlap_y] = torch.minimum(weight_y[:overlap_y], ramp_y)
         if not bottom_edge:
-            weight_y[-overlap:] = torch.minimum(weight_y[-overlap:], ramp_y.flip(0))
+            weight_y[-overlap_y:] = torch.minimum(weight_y[-overlap_y:], ramp_y.flip(0))
+
+    if overlap_x > 0:
+        ramp_x = torch.linspace(1.0 / overlap_x, 1.0, overlap_x, dtype=torch.float32, device=device)
         if not left_edge:
-            weight_x[:overlap] = torch.minimum(weight_x[:overlap], ramp_x)
+            weight_x[:overlap_x] = torch.minimum(weight_x[:overlap_x], ramp_x)
         if not right_edge:
-            weight_x[-overlap:] = torch.minimum(weight_x[-overlap:], ramp_x.flip(0))
+            weight_x[-overlap_x:] = torch.minimum(weight_x[-overlap_x:], ramp_x.flip(0))
 
     return (weight_y[:, None] * weight_x[None, :]).unsqueeze(0).unsqueeze(-1)
 
@@ -1941,39 +2335,121 @@ def _group_tile_jobs_by_decode_shape(tile_jobs: list[_ExpandedTileDecodeJob]) ->
     return [grouped[key] for key in order]
 
 
+def _group_tile_jobs_by_decode_window(tile_jobs: list[_ExpandedTileDecodeJob]) -> list[list[_ExpandedTileDecodeJob]]:
+    grouped: dict[tuple[int, int, int, int], list[_ExpandedTileDecodeJob]] = {}
+    order: list[tuple[int, int, int, int]] = []
+    for job in tile_jobs:
+        key = (job.decode_start_y, job.decode_start_x, job.decode_end_y, job.decode_end_x)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(job)
+    return [grouped[key] for key in order]
+
+
+def _group_tile_job_windows_by_decode_shape(
+    job_windows: list[list[_ExpandedTileDecodeJob]],
+) -> list[list[list[_ExpandedTileDecodeJob]]]:
+    grouped: dict[tuple[int, int], list[list[_ExpandedTileDecodeJob]]] = {}
+    order: list[tuple[int, int]] = []
+    for job_window in job_windows:
+        representative = job_window[0]
+        key = (
+            representative.decode_end_y - representative.decode_start_y,
+            representative.decode_end_x - representative.decode_start_x,
+        )
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(job_window)
+    return [grouped[key] for key in order]
+
+
+def _prepare_decode_latent(latent: Any, handle: PiDHandle) -> tuple[torch.Tensor, dict[str, int]]:
+    latent_tensor = _extract_latent_tensor(latent)
+    height = int(latent_tensor.shape[-2])
+    width = int(latent_tensor.shape[-1])
+    compression = handle.latent_compression
+    scale = handle.pid_scale
+
+    existing_geom = _extract_latent_geometry(latent)
+    if existing_geom is None:
+        geom = {
+            "original_height": height * compression,
+            "original_width": width * compression,
+            "aligned_height": height * compression,
+            "aligned_width": width * compression,
+            "pad_top": 0,
+            "pad_bottom": 0,
+            "pad_left": 0,
+            "pad_right": 0,
+            "pid_scale": scale,
+        }
+    else:
+        geom = dict(existing_geom)
+
+    return latent_tensor, geom
+
+
 def decode_latent(
     handle: PiDHandle,
     latent: Any,
     prompt: str,
+    negative_prompt: str,
     cfg_scale: float,
     pid_inference_steps: int,
     seed: int,
     degrade_sigma: float,
+    lq_conditioning_boost: float = 0.0,
+    source_denoise_strength: float = 1.0,
+    source_detail_noise_boost: float = 1.0,
+    source_image: Any = None,
     pid_prompt: Any = None,
     clip: Any = None,
     unique_id: str | None = None,
+    sampler: str = "sde",
+    scheduler: str = "original",
+    sde_noise_strength: float = 1.0,
 ) -> torch.Tensor:
+    latent_tensor, geom = _prepare_decode_latent(latent, handle)
+    latent_dict = {"samples": latent_tensor, LATENT_IMAGE_GEOMETRY_KEY: geom}
+
     prompt_value = _resolve_pid_prompt(handle, prompt, pid_prompt=pid_prompt, clip=clip)
+    uncond_prompt_value = (
+        _resolve_uncond_pid_prompt(handle, negative_prompt=negative_prompt, clip=clip)
+        if abs(float(cfg_scale) - 1.0) > 1e-6
+        else None
+    )
     effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else 4
     progress = _DecodeProgress(total=max(1, effective_steps), node_id=unique_id)
     samples = _decode_samples(
         handle=handle,
-        latent_tensor=_extract_latent_tensor(latent),
+        latent_tensor=latent_tensor,
         pid_prompt=prompt_value,
         cfg_scale=cfg_scale,
         pid_inference_steps=pid_inference_steps,
         seed=seed,
         degrade_sigma=degrade_sigma,
+        lq_conditioning_boost=lq_conditioning_boost,
+        source_image=resolve_reference_image(latent, source_image),
+        source_geometry=geom,
+        source_denoise_strength=source_denoise_strength,
+        source_detail_noise_boost=source_detail_noise_boost,
+        uncond_pid_prompt=uncond_prompt_value,
         progress=progress,
         preview_enabled=True,
+        sampler=sampler,
+        scheduler=scheduler,
+        sde_noise_strength=sde_noise_strength,
     )
-    return _restore_output_geometry(_samples_to_comfy_image(samples), latent, handle)
+    return _restore_output_geometry(_samples_to_comfy_image(samples), latent_dict, handle)
 
 
 def decode_latent_tiled(
     handle: PiDHandle,
     latent: Any,
     prompt: str,
+    negative_prompt: str,
     cfg_scale: float,
     pid_inference_steps: int,
     seed: int,
@@ -1981,17 +2457,18 @@ def decode_latent_tiled(
     tile_size: int,
     tile_overlap: int,
     tile_batch_size: int = 1,
+    lq_conditioning_boost: float = 0.0,
+    source_denoise_strength: float = 1.0,
+    source_detail_noise_boost: float = 1.0,
+    source_image: Any = None,
     pid_prompt: Any = None,
     clip: Any = None,
     unique_id: str | None = None,
+    sampler: str = "sde",
+    scheduler: str = "original",
+    sde_noise_strength: float = 1.0,
+    tiled_sde_noise_boost: float = 1.15,
 ) -> torch.Tensor:
-    latent_tensor = _extract_latent_tensor(latent)
-    if latent_tensor.shape[1] != handle.latent_channels:
-        raise ValueError(
-            f"Backbone '{handle.backbone}' espera {handle.latent_channels} canais no latent, "
-            f"mas recebeu {latent_tensor.shape[1]}."
-        )
-
     compression = handle.latent_compression
     if tile_size % compression != 0:
         raise ValueError(f"tile_size precisa ser multiplo de {compression} para o backbone '{handle.backbone}'.")
@@ -2000,149 +2477,74 @@ def decode_latent_tiled(
     if tile_batch_size <= 0:
         raise ValueError("tile_batch_size precisa ser maior que zero.")
 
-    tile_latent = tile_size // compression
-    overlap_latent = tile_overlap // compression
-    tile_jobs = _iter_tile_jobs(latent_tensor, compression, handle.pid_scale, tile_latent, overlap_latent)
-    expanded_jobs = [
-        _expand_tile_job(
-            job=job,
-            total_h=int(latent_tensor.shape[-2]),
-            total_w=int(latent_tensor.shape[-1]),
-            compression=compression,
-            pid_scale=handle.pid_scale,
-        )
-        for job in tile_jobs
-    ]
-
-    baseline_h = int(latent_tensor.shape[-2]) * compression
-    baseline_w = int(latent_tensor.shape[-1]) * compression
-    output_h = baseline_h * handle.pid_scale
-    output_w = baseline_w * handle.pid_scale
-    overlap_out = tile_overlap * handle.pid_scale
-
-    batch_size = int(latent_tensor.shape[0])
-    compose_device = torch.device("cpu")
-    output = torch.zeros((batch_size, output_h, output_w, 3), dtype=torch.float32, device=compose_device)
-    weight_sum = torch.zeros((batch_size, output_h, output_w, 1), dtype=torch.float32, device=compose_device)
+    latent_tensor, geom = _prepare_decode_latent(latent, handle)
+    latent_dict = {"samples": latent_tensor, LATENT_IMAGE_GEOMETRY_KEY: geom}
 
     prompt_value = _resolve_pid_prompt(handle, prompt, pid_prompt=pid_prompt, clip=clip)
-    tile_count = len(expanded_jobs)
+    uncond_prompt_value = (
+        _resolve_uncond_pid_prompt(handle, negative_prompt=negative_prompt, clip=clip)
+        if abs(float(cfg_scale) - 1.0) > 1e-6
+        else None
+    )
+
     effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else 4
-    progress = _DecodeProgress(total=max(1, tile_count * max(1, effective_steps)), node_id=unique_id)
-    model = _get_model(handle)
-    precision = _get_execution_dtype(model)
-    full_noise = _make_decode_noise(batch_size, output_h, output_w, "cpu", seed, dtype=torch.float32)
-    preview_h, preview_w = _get_preview_dimensions(output_h, output_w)
-    preview_canvas = torch.zeros((batch_size, preview_h, preview_w, 3), dtype=torch.float32, device=compose_device)
+    progress = _DecodeProgress(total=max(1, effective_steps), node_id=unique_id)
 
-    weight_cache: dict[tuple[int, int, int, bool, bool, bool, bool], torch.Tensor] = {}
-    grouped_jobs = _group_tile_jobs_by_decode_shape(expanded_jobs)
+    def _step_preview_callback(step_images: torch.Tensor) -> None:
+        try:
+            preview_tuple = _make_preview_tuple(step_images)
+        except Exception:
+            preview_tuple = None
+        progress.update(advance=1, preview=preview_tuple, emit_bar=True)
 
-    for job_group in grouped_jobs:
-        group_index = 0
-        while group_index < len(job_group):
-            job_batch = job_group[group_index : group_index + tile_batch_size]
-            group_index += len(job_batch)
+    effective_sde_noise_strength = float(sde_noise_strength) * float(tiled_sde_noise_boost)
+    print(
+        f"PiD tiled SDE: base={float(sde_noise_strength):.2f}, "
+        f"boost={float(tiled_sde_noise_boost):.2f}, effective={effective_sde_noise_strength:.2f}.",
+        flush=True,
+    )
+    if float(lq_conditioning_boost) > 0.0:
+        print(
+            f"PiD LQ conditioning: degrade_sigma={float(degrade_sigma):.2f}, "
+            f"boost={float(lq_conditioning_boost):.2f}, "
+            f"effective_sigma={float(degrade_sigma) - max(0.0, float(lq_conditioning_boost)):.2f}.",
+            flush=True,
+        )
+    if float(source_denoise_strength) < 1.0:
+        print(
+            f"PiD source init: denoise={float(source_denoise_strength):.2f}, "
+            f"detail_noise_boost={float(source_detail_noise_boost):.2f}.",
+            flush=True,
+        )
 
-            latent_batch = torch.cat(
-                [
-                    latent_tensor[:, :, job.decode_start_y : job.decode_end_y, job.decode_start_x : job.decode_end_x].contiguous()
-                    for job in job_batch
-                ],
-                dim=0,
-            )
-            noise_batch = torch.cat(
-                [
-                    full_noise[
-                        :,
-                        :,
-                        job.decode_start_y * compression * handle.pid_scale : job.decode_end_y * compression * handle.pid_scale,
-                        job.decode_start_x * compression * handle.pid_scale : job.decode_end_x * compression * handle.pid_scale,
-                    ].contiguous()
-                    for job in job_batch
-                ],
-                dim=0,
-            )
+    samples = _decode_samples(
+        handle=handle,
+        latent_tensor=latent_tensor,
+        pid_prompt=prompt_value,
+        cfg_scale=cfg_scale,
+        pid_inference_steps=pid_inference_steps,
+        seed=seed,
+        degrade_sigma=degrade_sigma,
+        lq_conditioning_boost=lq_conditioning_boost,
+        source_image=resolve_reference_image(latent, source_image),
+        source_geometry=geom,
+        source_denoise_strength=source_denoise_strength,
+        source_detail_noise_boost=source_detail_noise_boost,
+        uncond_pid_prompt=uncond_prompt_value,
+        progress=progress,
+        preview_enabled=True,
+        progress_advance=1,
+        step_preview_callback=_step_preview_callback,
+        sampler=sampler,
+        scheduler=scheduler,
+        sde_noise_strength=effective_sde_noise_strength,
+        use_tiled=True,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
+        tile_batch_size=tile_batch_size,
+    )
 
-            def _step_preview_callback(step_images: torch.Tensor) -> None:
-                preview_frame = preview_canvas.clone()
-                step_images_cpu = step_images.to(device=compose_device)
-                if step_images_cpu.ndim != 4:
-                    return
-                if int(step_images_cpu.shape[-1]) != 3 and int(step_images_cpu.shape[1]) == 3:
-                    step_images_cpu = step_images_cpu.permute(0, 2, 3, 1).contiguous()
-                for offset, job in enumerate(job_batch):
-                    tile_image = step_images_cpu[offset * batch_size : (offset + 1) * batch_size]
-                    target_h = (job.target_end_y - job.target_start_y) * compression * handle.pid_scale
-                    target_w = (job.target_end_x - job.target_start_x) * compression * handle.pid_scale
-                    tile_image = tile_image[:, job.crop_y : job.crop_y + target_h, job.crop_x : job.crop_x + target_w, :]
-                    _write_tile_to_preview_canvas(
-                        preview_frame,
-                        tile_image,
-                        job.out_y,
-                        job.out_x,
-                        output_h,
-                        output_w,
-                    )
-                progress.update(advance=len(job_batch), preview=_make_preview_tuple(preview_frame.permute(0, 3, 1, 2)), emit_bar=True)
-
-            tile_samples = _decode_samples(
-                handle=handle,
-                latent_tensor=latent_batch,
-                pid_prompt=_repeat_pid_prompt(prompt_value, len(job_batch), batch_size),
-                cfg_scale=cfg_scale,
-                pid_inference_steps=pid_inference_steps,
-                seed=seed,
-                degrade_sigma=degrade_sigma,
-                progress=progress,
-                preview_enabled=True,
-                noise=noise_batch,
-                progress_advance=len(job_batch),
-                step_preview_callback=_step_preview_callback,
-            )
-            tile_images = _samples_to_image_tensor(tile_samples).to(device=compose_device)
-
-            for offset, job in enumerate(job_batch):
-                tile_image = tile_images[offset * batch_size : (offset + 1) * batch_size]
-                target_h = (job.target_end_y - job.target_start_y) * compression * handle.pid_scale
-                target_w = (job.target_end_x - job.target_start_x) * compression * handle.pid_scale
-                tile_image = tile_image[:, job.crop_y : job.crop_y + target_h, job.crop_x : job.crop_x + target_w, :]
-                tile_h = int(tile_image.shape[1])
-                tile_w = int(tile_image.shape[2])
-                weight_key = (
-                    tile_h,
-                    tile_w,
-                    min(overlap_out, tile_h // 2, tile_w // 2),
-                    job.target_start_y == 0,
-                    job.target_end_y == int(latent_tensor.shape[-2]),
-                    job.target_start_x == 0,
-                    job.target_end_x == int(latent_tensor.shape[-1]),
-                )
-                weight = weight_cache.get(weight_key)
-                if weight is None:
-                    weight = _tile_weight_mask(
-                        height=tile_h,
-                        width=tile_w,
-                        overlap=weight_key[2],
-                        top_edge=weight_key[3],
-                        bottom_edge=weight_key[4],
-                        left_edge=weight_key[5],
-                        right_edge=weight_key[6],
-                        device=compose_device,
-                    )
-                    weight_cache[weight_key] = weight
-                output[:, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w, :] += tile_image * weight
-                weight_sum[:, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w, :] += weight
-                _write_tile_to_preview_canvas(
-                    preview_canvas,
-                    tile_image,
-                    job.out_y,
-                    job.out_x,
-                    output_h,
-                    output_w,
-                )
-
-    final_image = _restore_output_geometry((output / weight_sum.clamp_min(1e-6)).cpu(), latent, handle)
+    final_image = _restore_output_geometry(_samples_to_comfy_image(samples), latent_dict, handle)
     final_preview = None
     try:
         final_preview = _make_preview_tuple(final_image.permute(0, 3, 1, 2))
@@ -2153,14 +2555,19 @@ def decode_latent_tiled(
 
     return final_image
 
-
 def pid_ksampler(
     handle: PiDHandle,
     latent: Any,
     prompt: str,
+    negative_prompt: str,
+    cfg_scale: float,
     pid_inference_steps: int,
     seed: int,
     degrade_sigma: float,
+    lq_conditioning_boost: float = 0.0,
+    source_denoise_strength: float = 1.0,
+    source_detail_noise_boost: float = 1.0,
+    source_image: Any = None,
     keep_model_loaded_on_gpu: bool = True,
     use_tiled: bool = False,
     tile_size: int = 256,
@@ -2169,6 +2576,10 @@ def pid_ksampler(
     pid_prompt: Any = None,
     clip: Any = None,
     unique_id: str | None = None,
+    sampler: str = "sde",
+    scheduler: str = "original",
+    sde_noise_strength: float = 1.0,
+    tiled_sde_noise_boost: float = 1.15,
 ) -> torch.Tensor:
     try:
         if use_tiled:
@@ -2176,31 +2587,97 @@ def pid_ksampler(
                 handle=handle,
                 latent=latent,
                 prompt=prompt,
-                cfg_scale=1.0,
+                negative_prompt=negative_prompt,
+                cfg_scale=cfg_scale,
                 pid_inference_steps=pid_inference_steps,
                 seed=seed,
                 degrade_sigma=degrade_sigma,
+                lq_conditioning_boost=lq_conditioning_boost,
+                source_denoise_strength=source_denoise_strength,
+                source_detail_noise_boost=source_detail_noise_boost,
+                source_image=source_image,
                 tile_size=tile_size,
                 tile_overlap=tile_overlap,
                 tile_batch_size=tile_batch_size,
                 pid_prompt=pid_prompt,
                 clip=clip,
                 unique_id=unique_id,
+                sampler=sampler,
+                scheduler=scheduler,
+                sde_noise_strength=sde_noise_strength,
+                tiled_sde_noise_boost=tiled_sde_noise_boost,
             )
 
         return decode_latent(
             handle=handle,
             latent=latent,
             prompt=prompt,
-            cfg_scale=1.0,
+            negative_prompt=negative_prompt,
+            cfg_scale=cfg_scale,
             pid_inference_steps=pid_inference_steps,
             seed=seed,
             degrade_sigma=degrade_sigma,
+            lq_conditioning_boost=lq_conditioning_boost,
+            source_denoise_strength=source_denoise_strength,
+            source_detail_noise_boost=source_detail_noise_boost,
+            source_image=source_image,
             pid_prompt=pid_prompt,
             clip=clip,
             unique_id=unique_id,
+            sampler=sampler,
+            scheduler=scheduler,
+            sde_noise_strength=sde_noise_strength,
         )
     finally:
         if not keep_model_loaded_on_gpu:
             model = _get_model(handle)
             _set_runtime_net_device(model, "cpu")
+
+
+def match_colors(target: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Aligns target's channel-wise mean and standard deviation with reference's."""
+    B = target.shape[0]
+    C = target.shape[3]
+
+    device = target.device
+    dtype = target.dtype
+    ref = reference.to(device=device, dtype=dtype)
+
+    if ref.shape[0] == 1 and B > 1:
+        ref = ref.expand(B, -1, -1, -1)
+
+    out = target.clone()
+    for b in range(B):
+        for c in range(C):
+            ref_chan = ref[b, ..., c]
+            tgt_chan = target[b, ..., c]
+
+            mu_ref = ref_chan.mean()
+            std_ref = ref_chan.std().clamp_min(1e-6)
+
+            mu_tgt = tgt_chan.mean()
+            std_tgt = tgt_chan.std().clamp_min(1e-6)
+
+            matched_chan = ((tgt_chan - mu_tgt) / std_tgt) * std_ref + mu_ref
+
+            # Highlight & shadow protection to prevent blowout/clipping
+            threshold_hi = 0.8
+            threshold_lo = 0.1
+            mask_hi = torch.clamp((tgt_chan - threshold_hi) / (1.0 - threshold_hi), 0.0, 1.0) ** 2
+            mask_lo = torch.clamp((threshold_lo - tgt_chan) / threshold_lo, 0.0, 1.0) ** 2
+            mask = mask_hi + mask_lo
+
+            out[b, ..., c] = (1.0 - mask) * matched_chan + mask * tgt_chan
+
+    return out.clamp(0.0, 1.0)
+
+
+def resolve_reference_image(latent: Any, image_ref: Any = None) -> torch.Tensor | None:
+    """Prefer an explicit reference, then fall back to the image stored by PiD Encode Image."""
+    if image_ref is not None:
+        return _extract_image_tensor(image_ref)
+    if isinstance(latent, dict):
+        reference = latent.get(LATENT_REFERENCE_IMAGE_KEY)
+        if reference is not None:
+            return _extract_image_tensor(reference)
+    return None
