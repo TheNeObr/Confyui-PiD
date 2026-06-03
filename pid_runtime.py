@@ -2492,14 +2492,16 @@ def _tile_weight_mask(
     weight_x = torch.ones((width,), dtype=torch.float32, device=device)
 
     if overlap_y > 0:
-        ramp_y = torch.linspace(1.0 / overlap_y, 1.0, overlap_y, dtype=torch.float32, device=device)
+        ramp_pos_y = torch.linspace(0.0, 1.0, overlap_y, dtype=torch.float32, device=device)
+        ramp_y = 0.5 - 0.5 * torch.cos(ramp_pos_y * torch.pi)
         if not top_edge:
             weight_y[:overlap_y] = torch.minimum(weight_y[:overlap_y], ramp_y)
         if not bottom_edge:
             weight_y[-overlap_y:] = torch.minimum(weight_y[-overlap_y:], ramp_y.flip(0))
 
     if overlap_x > 0:
-        ramp_x = torch.linspace(1.0 / overlap_x, 1.0, overlap_x, dtype=torch.float32, device=device)
+        ramp_pos_x = torch.linspace(0.0, 1.0, overlap_x, dtype=torch.float32, device=device)
+        ramp_x = 0.5 - 0.5 * torch.cos(ramp_pos_x * torch.pi)
         if not left_edge:
             weight_x[:overlap_x] = torch.minimum(weight_x[:overlap_x], ramp_x)
         if not right_edge:
