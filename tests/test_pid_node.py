@@ -825,12 +825,62 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertGreater(mask[0, 0, 0, 48, 48].item(), 0.0)
 
     def test_removed_backbones_are_rejected(self):
-        for backbone in ("zimage", "dinov2", "siglip"):
+        for backbone in ("dinov2", "siglip"):
             with self.subTest(backbone=backbone):
                 with self.assertRaises(ValueError):
                     pid_runtime._asset_patterns(backbone, "2k")
                 with self.assertRaises(ValueError):
                     pid_runtime._instantiate_vae_encoder(backbone)
+
+    def test_upstream_20260602_backbones_and_flux2_checkpoint_are_registered(self):
+        self.assertIn("sdxl", pid_runtime.SUPPORTED_BACKBONES)
+        self.assertIn("qwenimage", pid_runtime.SUPPORTED_BACKBONES)
+        self.assertIn("qwenimage-2512", pid_runtime.SUPPORTED_BACKBONES)
+        self.assertIn("zimage", pid_runtime.SUPPORTED_BACKBONES)
+        self.assertIn("zimage-turbo", pid_runtime.SUPPORTED_BACKBONES)
+        self.assertIn("flux2-klein-4b", pid_runtime.SUPPORTED_BACKBONES)
+        self.assertIn("flux2-klein-9b", pid_runtime.SUPPORTED_BACKBONES)
+
+        flux2_patterns = pid_runtime._asset_patterns("flux2", "2kto4k")
+        self.assertIn("checkpoints/PiD_res2kto4k_sr4x_official_flux2_distill_4step_2606/*", flux2_patterns)
+        self.assertNotIn("checkpoints/PiD_res2kto4k_sr4x_official_flux2_distill_4step/*", flux2_patterns)
+
+        sdxl_patterns = pid_runtime._asset_patterns("sdxl", "2kto4k")
+        self.assertIn("checkpoints/PiD_res2kto4k_sr4x_official_sdxl_distill_4step/*", sdxl_patterns)
+        self.assertIn("checkpoints/sdxl_vae.safetensors", sdxl_patterns)
+
+        qwen_patterns = pid_runtime._asset_patterns("qwenimage-2512", "2kto4k")
+        self.assertIn("checkpoints/PiD_res2kto4k_sr4x_official_qwenimage_distill_4step/*", qwen_patterns)
+        self.assertIn("checkpoints/QwenImage_VAE_2d.pth", qwen_patterns)
+
+        zimage_patterns = pid_runtime._asset_patterns("zimage-turbo", "2kto4k")
+        self.assertIn("checkpoints/PiD_res2kto4k_sr4x_official_flux_distill_4step/*", zimage_patterns)
+        self.assertIn("checkpoints/ae.safetensors", zimage_patterns)
+
+        with self.assertRaises(ValueError):
+            pid_runtime._asset_patterns("sdxl", "2k")
+        with self.assertRaises(ValueError):
+            pid_runtime._asset_patterns("qwenimage", "2k")
+
+    def test_upstream_checkpoint_registry_excludes_dinov2_siglip_and_uses_flux2_2606(self):
+        pid_runtime._ensure_upstream_path()
+        from pid._src.inference.checkpoint_registry import get_pid_checkpoint
+
+        flux2 = get_pid_checkpoint("flux2", "2kto4k")
+        self.assertEqual(flux2.experiment, "PiD_res2kto4k_sr4x_official_flux2_distill_4step")
+        self.assertIn("PiD_res2kto4k_sr4x_official_flux2_distill_4step_2606", flux2.checkpoint_path)
+
+        klein = get_pid_checkpoint("flux2-klein-9b", "2kto4k")
+        self.assertEqual(klein, flux2)
+        zimage = get_pid_checkpoint("zimage", "2kto4k")
+        self.assertEqual(zimage.experiment, "PiD_res2kto4k_sr4x_official_flux_distill_4step")
+        qwen = get_pid_checkpoint("qwenimage-2512", "2kto4k")
+        self.assertEqual(qwen.experiment, "PiD_res2kto4k_sr4x_official_qwenimage_distill_4step")
+
+        with self.assertRaises(KeyError):
+            get_pid_checkpoint("dinov2", "2k")
+        with self.assertRaises(KeyError):
+            get_pid_checkpoint("siglip", "2k")
 
     def test_group_tile_jobs_by_decode_shape_batches_non_consecutive_matches(self):
         jobs = [

@@ -23,18 +23,67 @@ HF_PID_TEXT_ENCODER_FILE = "split_files/text_encoders/gemma_2_2b_fp16.safetensor
 HF_PID_TEXT_ENCODER_TOKENIZER_REPO_ID = "Efficient-Large-Model/gemma-2-2b-it"
 HF_PID_TEXT_ENCODER_TOKENIZER_FILE = "tokenizer.model"
 
-SUPPORTED_BACKBONES = ("flux", "sd3", "flux2")
+SUPPORTED_BACKBONES = (
+    "flux",
+    "sd3",
+    "flux2",
+    "flux2-klein-4b",
+    "flux2-klein-9b",
+    "sdxl",
+    "qwenimage",
+    "qwenimage-2512",
+    "zimage",
+    "zimage-turbo",
+)
 SUPPORTED_VARIANTS = ("2k", "2kto4k")
 SUPPORTED_LATENT_INTERPOLATIONS = ("nearest-exact", "bilinear", "bicubic", "area")
-LATENT_CHANNELS = {"flux": 16, "sd3": 16, "flux2": 128}
-LATENT_COMPRESSION = {"flux": 8, "sd3": 8, "flux2": 16}
+LATENT_CHANNELS = {
+    "flux": 16,
+    "sd3": 16,
+    "flux2": 128,
+    "flux2-klein-4b": 128,
+    "flux2-klein-9b": 128,
+    "sdxl": 4,
+    "qwenimage": 16,
+    "qwenimage-2512": 16,
+    "zimage": 16,
+    "zimage-turbo": 16,
+}
+LATENT_COMPRESSION = {
+    "flux": 8,
+    "sd3": 8,
+    "flux2": 16,
+    "flux2-klein-4b": 16,
+    "flux2-klein-9b": 16,
+    "sdxl": 8,
+    "qwenimage": 8,
+    "qwenimage-2512": 8,
+    "zimage": 8,
+    "zimage-turbo": 8,
+}
+_BACKBONE_VARIANTS = {
+    "sdxl": ("2kto4k",),
+    "qwenimage": ("2kto4k",),
+    "qwenimage-2512": ("2kto4k",),
+}
 PID_TEXT_EMBED_DIM = 2304
 PID_TEXT_TOKEN_COUNT = 300
 MAX_PROMPT_CACHE_ITEMS = 8
-AUTOENCODE_TILE_OVERLAP = {"flux": 128, "sd3": 128, "flux2": 128}
+AUTOENCODE_TILE_OVERLAP = {backbone: 128 for backbone in SUPPORTED_BACKBONES}
 # Tiles muito pequenos tendem a colapsar a cor no PiD; decodificamos com contexto maior
 # e recortamos o centro para manter a saida pedida sem o desvio verde.
-MIN_TILED_DECODE_SIZE = {"flux": 512, "sd3": 512, "flux2": 1024}
+MIN_TILED_DECODE_SIZE = {
+    "flux": 512,
+    "sd3": 512,
+    "flux2": 1024,
+    "flux2-klein-4b": 1024,
+    "flux2-klein-9b": 1024,
+    "sdxl": 512,
+    "qwenimage": 512,
+    "qwenimage-2512": 512,
+    "zimage": 512,
+    "zimage-turbo": 512,
+}
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
@@ -488,20 +537,25 @@ def _canonical_backbone(backbone: str) -> str:
 
 
 def _validate_backbone_variant(backbone: str, ckpt_type: str) -> None:
-    if ckpt_type not in SUPPORTED_VARIANTS:
-        raise ValueError(f"Unsupported PiD variant '{ckpt_type}' for backbone '{backbone}'. Valid: {SUPPORTED_VARIANTS}")
+    allowed = _BACKBONE_VARIANTS.get(backbone, SUPPORTED_VARIANTS)
+    if ckpt_type not in allowed:
+        raise ValueError(f"Unsupported PiD variant '{ckpt_type}' for backbone '{backbone}'. Valid: {allowed}")
 
 
 def _asset_patterns(backbone: str, ckpt_type: str) -> list[str]:
     if backbone not in SUPPORTED_BACKBONES:
         raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
     _validate_backbone_variant(backbone, ckpt_type)
-    if backbone == "flux":
+    if backbone in ("flux", "zimage", "zimage-turbo"):
         extra_patterns = ["checkpoints/ae.safetensors"]
     elif backbone == "sd3":
         extra_patterns = ["checkpoints/sd3_vae/*"]
-    elif backbone == "flux2":
+    elif backbone in ("flux2", "flux2-klein-4b", "flux2-klein-9b"):
         extra_patterns = ["checkpoints/flux2_ae.safetensors"]
+    elif backbone == "sdxl":
+        extra_patterns = ["checkpoints/sdxl_vae.safetensors"]
+    elif backbone in ("qwenimage", "qwenimage-2512"):
+        extra_patterns = ["checkpoints/QwenImage_VAE_2d.pth"]
     else:
         extra_patterns = []
     ckpt_name = {
@@ -510,21 +564,38 @@ def _asset_patterns(backbone: str, ckpt_type: str) -> list[str]:
         ("sd3", "2k"): "PiD_res2k_sr4x_official_sd3_distill_4step",
         ("sd3", "2kto4k"): "PiD_res2kto4k_sr4x_official_sd3_distill_4step",
         ("flux2", "2k"): "PiD_res2k_sr4x_official_flux2_distill_4step",
-        ("flux2", "2kto4k"): "PiD_res2kto4k_sr4x_official_flux2_distill_4step",
+        ("flux2", "2kto4k"): "PiD_res2kto4k_sr4x_official_flux2_distill_4step_2606",
+        ("flux2-klein-4b", "2k"): "PiD_res2k_sr4x_official_flux2_distill_4step",
+        ("flux2-klein-4b", "2kto4k"): "PiD_res2kto4k_sr4x_official_flux2_distill_4step_2606",
+        ("flux2-klein-9b", "2k"): "PiD_res2k_sr4x_official_flux2_distill_4step",
+        ("flux2-klein-9b", "2kto4k"): "PiD_res2kto4k_sr4x_official_flux2_distill_4step_2606",
+        ("sdxl", "2kto4k"): "PiD_res2kto4k_sr4x_official_sdxl_distill_4step",
+        ("qwenimage", "2kto4k"): "PiD_res2kto4k_sr4x_official_qwenimage_distill_4step",
+        ("qwenimage-2512", "2kto4k"): "PiD_res2kto4k_sr4x_official_qwenimage_distill_4step",
+        ("zimage", "2k"): "PiD_res2k_sr4x_official_flux_distill_4step",
+        ("zimage", "2kto4k"): "PiD_res2kto4k_sr4x_official_flux_distill_4step",
+        ("zimage-turbo", "2k"): "PiD_res2k_sr4x_official_flux_distill_4step",
+        ("zimage-turbo", "2kto4k"): "PiD_res2kto4k_sr4x_official_flux_distill_4step",
     }[(backbone, ckpt_type)]
     return [f"checkpoints/{ckpt_name}/*", *extra_patterns]
 
 
 def _tokenizer_overrides(backbone: str) -> list[str]:
     backbone = _canonical_backbone(backbone)
-    if backbone == "flux":
+    if backbone in ("flux", "zimage", "zimage-turbo"):
         vae_path = UPSTREAM_ROOT / "checkpoints" / "ae.safetensors"
         return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
     if backbone == "sd3":
         vae_path = UPSTREAM_ROOT / "checkpoints" / "sd3_vae" / "vae" / "diffusion_pytorch_model.safetensors"
         return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
-    if backbone == "flux2":
+    if backbone in ("flux2", "flux2-klein-4b", "flux2-klein-9b"):
         vae_path = UPSTREAM_ROOT / "checkpoints" / "flux2_ae.safetensors"
+        return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
+    if backbone == "sdxl":
+        vae_path = UPSTREAM_ROOT / "checkpoints" / "sdxl_vae.safetensors"
+        return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
+    if backbone in ("qwenimage", "qwenimage-2512"):
+        vae_path = UPSTREAM_ROOT / "checkpoints" / "QwenImage_VAE_2d.pth"
         return [f"+model.config.tokenizer.vae_pth={vae_path.resolve().as_posix()}"]
     return []
 
@@ -570,15 +641,21 @@ def _instantiate_vae_encoder(backbone: str, tokenizer_config: Any = None) -> Any
         from pid._ext.imaginaire.lazy_config import instantiate as lazy_instantiate
         with _pushd(UPSTREAM_ROOT):
             return lazy_instantiate(tokenizer_config)
-    if backbone == "flux":
+    if backbone in ("flux", "zimage", "zimage-turbo"):
         from pid._src.tokenizers.flux_vae import FluxVAEInterface
         return FluxVAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "ae.safetensors").as_posix())
     if backbone == "sd3":
         from pid._src.tokenizers.flux_vae import SD3VAEInterface
         return SD3VAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "sd3_vae" / "vae" / "diffusion_pytorch_model.safetensors").as_posix())
-    if backbone == "flux2":
+    if backbone in ("flux2", "flux2-klein-4b", "flux2-klein-9b"):
         from pid._src.tokenizers.flux2_vae import Flux2VAEInterface
         return Flux2VAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "flux2_ae.safetensors").as_posix())
+    if backbone == "sdxl":
+        from pid._src.tokenizers.sdxl_vae import SDXLVAEInterface
+        return SDXLVAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "sdxl_vae.safetensors").as_posix())
+    if backbone in ("qwenimage", "qwenimage-2512"):
+        from pid._src.tokenizers.qwenimage_vae import QwenImageVAEInterface
+        return QwenImageVAEInterface(vae_pth=(UPSTREAM_ROOT / "checkpoints" / "QwenImage_VAE_2d.pth").as_posix())
     raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
 
 
@@ -669,11 +746,11 @@ def _patch_native_pid_attention_dtype_mismatch() -> None:
 
 def _native_lq_latent_process_in(backbone: str, latent: torch.Tensor) -> torch.Tensor:
     import comfy.latent_formats
-    if backbone == "flux":
+    if backbone in ("flux", "zimage", "zimage-turbo"):
         return comfy.latent_formats.Flux().process_in(latent)
     if backbone == "sd3":
         return comfy.latent_formats.SD3().process_in(latent)
-    if backbone == "flux2":
+    if backbone in ("flux2", "flux2-klein-4b", "flux2-klein-9b"):
         return comfy.latent_formats.Flux2().process_in(latent)
     return latent
 

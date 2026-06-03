@@ -4,7 +4,7 @@ Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, with
 
 ## What This Package Does
 
-- Loads the official PiD checkpoints for `flux`, `sd3`, and `flux2`.
+- Loads the official PiD checkpoints for `flux`, `sd3`, `flux2`, `flux2-klein-4b`, `flux2-klein-9b`, `sdxl`, `qwenimage`, `qwenimage-2512`, `zimage`, and `zimage-turbo`.
 - Supports prompt pre-encoding to reduce repeated text encoder cost, including optional external `CLIP` input with ComfyUI `pixeldit` format.
 - Supports image encoding with PiD's own encoder to generate compatible latents.
 - Keeps the runtime lazy so loading the node does not immediately force the full PiD network and text stack onto GPU.
@@ -126,6 +126,13 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 - `flux`
 - `sd3`
 - `flux2`
+- `flux2-klein-4b`
+- `flux2-klein-9b`
+- `sdxl`
+- `qwenimage`
+- `qwenimage-2512`
+- `zimage`
+- `zimage-turbo`
 
 ## Official Resources And Disclaimer
 
@@ -139,6 +146,11 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 ## Important Notes
 
 - The backbone selected in `PiD Load Model` must match the latent family.
+- `dinov2` and `siglip` are intentionally not supported in this v2 branch.
+- `flux2` with `checkpoint_variant = 2kto4k` uses the upstream `_2606` checkpoint, which replaced the earlier Flux2 2kto4k weight to fix color drift.
+- `sdxl`, `qwenimage`, and `qwenimage-2512` currently support only the upstream `2kto4k` PiD checkpoint.
+- `zimage` and `zimage-turbo` reuse the official PiD Flux checkpoint and Flux VAE path, matching the upstream alias.
+- `flux2-klein-4b` and `flux2-klein-9b` reuse the official PiD Flux2 checkpoint and Flux2 VAE path, matching the upstream alias.
 - The current architecture stays on the stable PiD wrapper path for actual decode quality, while trimming unnecessary load/prefetch behavior around it.
 - The first load downloads weights from the [`nvidia/PiD`](https://huggingface.co/nvidia/PiD) repository.
 - Downloaded PiD checkpoint files are stored locally in `upstream-pid/checkpoints/` inside this custom node directory.
@@ -171,8 +183,8 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 - As a practical rule, `2k` is usually the safer choice around a `512` base workflow, while `2kto4k` is usually the safer choice around a `1024` base workflow.
 - Using the `2k` checkpoint variant with `1024` in direct non-tiled decoding can still be accepted by the model, but it is more likely to produce green artifacts, color collapse, or unstable results than the same workflow at `512`.
 - Tiled decoding is often more stable at larger resolutions because the model processes smaller local regions instead of one large full-frame decode, so `1024` and larger outputs tend to behave better in tiled mode than in direct mode.
-- For best stability, prefer generating or encoding directly at the target aspect ratio and keep dimensions aligned to the backbone: multiples of `32` are safer for `flux` and `sd3`, and multiples of `64` are safer for `flux2`.
-- For `flux2`, the encode path is especially strict because the VAE uses an effective `16x` spatial compression and an internal `2x2` patchification step, so dimensions that drift away from the safe multiples are more likely to fail or produce unstable colors.
+- For best stability, prefer generating or encoding directly at the target aspect ratio and keep dimensions aligned to the backbone: multiples of `32` are safer for `flux`, `sd3`, `sdxl`, `qwenimage`, `qwenimage-2512`, `zimage`, and `zimage-turbo`; multiples of `64` are safer for `flux2` and the `flux2-klein` aliases.
+- For `flux2` and the `flux2-klein` aliases, the encode path is especially strict because the VAE uses an effective `16x` spatial compression and an internal `2x2` patchification step, so dimensions that drift away from the safe multiples are more likely to fail or produce unstable colors.
 - The `nvidia/PiD` model has its own NVIDIA usage terms. Check the model card license before distributing or using it in production.
 
 ## Local Validation
