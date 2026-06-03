@@ -362,6 +362,51 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertEqual(tuple(image.shape), (1, 280, 380, 3))
 
+    def test_decode_latent_restores_geometry_from_encode_reference_when_metadata_is_missing(self):
+        model = DummyModel()
+        handle = self._register_runtime(model, backbone="flux", latent_channels=16, latent_compression=8)
+        latent = {
+            "samples": torch.zeros((1, 16, 12, 12), dtype=torch.float32),
+            pid_runtime.LATENT_REFERENCE_IMAGE_KEY: torch.ones((1, 70, 95, 3), dtype=torch.float32),
+        }
+
+        image = pid_runtime.decode_latent(
+            handle=handle,
+            latent=latent,
+            prompt="cat",
+            negative_prompt="",
+            cfg_scale=1.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 280, 380, 3))
+
+    def test_decode_latent_tiled_restores_geometry_from_encode_reference_when_metadata_is_missing(self):
+        model = DummyModel()
+        handle = self._register_runtime(model, backbone="flux", latent_channels=16, latent_compression=8)
+        latent = {
+            "samples": torch.zeros((1, 16, 12, 12), dtype=torch.float32),
+            pid_runtime.LATENT_REFERENCE_IMAGE_KEY: torch.ones((1, 70, 95, 3), dtype=torch.float32),
+        }
+
+        image = pid_runtime.decode_latent_tiled(
+            handle=handle,
+            latent=latent,
+            prompt="cat",
+            negative_prompt="",
+            cfg_scale=1.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            tile_size=32,
+            tile_overlap=8,
+            tile_batch_size=1,
+        )
+
+        self.assertEqual(tuple(image.shape), (1, 280, 380, 3))
+
     def test_decode_latent_tiled_blends_tiles_into_full_image(self):
         model = DummyModel()
         handle = self._register_runtime(model)

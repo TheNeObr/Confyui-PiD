@@ -2550,6 +2550,38 @@ def _group_tile_job_windows_by_decode_shape(
     return [grouped[key] for key in order]
 
 
+def _build_decode_geometry_from_reference(
+    latent: Any,
+    handle: PiDHandle,
+    latent_height: int,
+    latent_width: int,
+) -> dict[str, int] | None:
+    reference = resolve_reference_image(latent)
+    if reference is None:
+        return None
+
+    original_height = int(reference.shape[1])
+    original_width = int(reference.shape[2])
+    aligned_height = int(latent_height * handle.latent_compression)
+    aligned_width = int(latent_width * handle.latent_compression)
+    pad_h = aligned_height - original_height
+    pad_w = aligned_width - original_width
+    if pad_h < 0 or pad_w < 0:
+        return None
+
+    return {
+        "original_height": original_height,
+        "original_width": original_width,
+        "aligned_height": aligned_height,
+        "aligned_width": aligned_width,
+        "pad_top": pad_h // 2,
+        "pad_bottom": pad_h - (pad_h // 2),
+        "pad_left": pad_w // 2,
+        "pad_right": pad_w - (pad_w // 2),
+        "pid_scale": handle.pid_scale,
+    }
+
+
 def _prepare_decode_latent(latent: Any, handle: PiDHandle) -> tuple[torch.Tensor, dict[str, int]]:
     latent_tensor = _extract_latent_tensor(latent)
     height = int(latent_tensor.shape[-2])
@@ -2559,6 +2591,11 @@ def _prepare_decode_latent(latent: Any, handle: PiDHandle) -> tuple[torch.Tensor
 
     existing_geom = _extract_latent_geometry(latent)
     if existing_geom is None:
+        geom = _build_decode_geometry_from_reference(latent, handle, height, width)
+    else:
+        geom = dict(existing_geom)
+
+    if geom is None:
         geom = {
             "original_height": height * compression,
             "original_width": width * compression,
@@ -2570,8 +2607,6 @@ def _prepare_decode_latent(latent: Any, handle: PiDHandle) -> tuple[torch.Tensor
             "pad_right": 0,
             "pid_scale": scale,
         }
-    else:
-        geom = dict(existing_geom)
 
     return latent_tensor, geom
 
