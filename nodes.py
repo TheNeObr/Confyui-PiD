@@ -14,6 +14,8 @@ from .pid_runtime import (
     resolve_reference_image,
 )
 
+COLOR_MATCH_OPTIONS = ["disabled", "reinhard_rgb", "wavelet"]
+
 
 def _format_image_resolution(image) -> str:
     height = int(image.shape[1])
@@ -23,6 +25,13 @@ def _format_image_resolution(image) -> str:
 
 def _with_resolution_ui(image):
     return {"ui": {"text": (_format_image_resolution(image),)}, "result": (image,)}
+
+
+def _apply_color_match(image, latent, image_ref, color_match: str):
+    reference = resolve_reference_image(latent, image_ref)
+    if color_match != "disabled" and reference is not None:
+        return match_colors(image, reference, method=color_match)
+    return image
 
 
 class PiDLoadModel:
@@ -65,9 +74,8 @@ class PiDDecodeLatent:
                 "lq_conditioning_boost": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "source_denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "source_detail_noise_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                "scheduler": (["original", "uniform", "cosine", "quadratic"], {"default": "original"}),
                 "sde_noise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "color_match": (["disabled", "reinhard_rgb"], {"default": "disabled"}),
+                "color_match": (COLOR_MATCH_OPTIONS, {"default": "disabled"}),
             },
             "optional": {
                 "pid_prompt": ("PID_PROMPT",),
@@ -120,9 +128,7 @@ class PiDDecodeLatent:
             scheduler=scheduler,
             sde_noise_strength=sde_noise_strength,
         )
-        reference = resolve_reference_image(latent, image_ref)
-        if color_match == "reinhard_rgb" and reference is not None:
-            image = match_colors(image, reference)
+        image = _apply_color_match(image, latent, image_ref, color_match)
         return _with_resolution_ui(image)
 
 
@@ -197,10 +203,9 @@ class PiDKSampler:
                 "tile_batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
                 "seam_refine": ("BOOLEAN", {"default": False}),
                 "seam_refine_strength": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "scheduler": (["original", "uniform", "cosine", "quadratic"], {"default": "original"}),
                 "sde_noise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "tiled_sde_noise_boost": ("FLOAT", {"default": 1.15, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "color_match": (["disabled", "reinhard_rgb"], {"default": "disabled"}),
+                "color_match": (COLOR_MATCH_OPTIONS, {"default": "disabled"}),
             },
             "optional": {
                 "pid_prompt": ("PID_PROMPT",),
@@ -269,9 +274,7 @@ class PiDKSampler:
             sde_noise_strength=sde_noise_strength,
             tiled_sde_noise_boost=tiled_sde_noise_boost,
         )
-        reference = resolve_reference_image(latent, image_ref)
-        if color_match == "reinhard_rgb" and reference is not None:
-            image = match_colors(image, reference)
+        image = _apply_color_match(image, latent, image_ref, color_match)
         return _with_resolution_ui(image)
 
 
@@ -301,10 +304,9 @@ class PiDDecodeLatentTiled:
                 "lq_conditioning_boost": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "source_denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "source_detail_noise_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                "scheduler": (["original", "uniform", "cosine", "quadratic"], {"default": "original"}),
                 "sde_noise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "tiled_sde_noise_boost": ("FLOAT", {"default": 1.15, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "color_match": (["disabled", "reinhard_rgb"], {"default": "disabled"}),
+                "color_match": (COLOR_MATCH_OPTIONS, {"default": "disabled"}),
             },
             "optional": {
                 "pid_prompt": ("PID_PROMPT",),
@@ -369,9 +371,7 @@ class PiDDecodeLatentTiled:
             sde_noise_strength=sde_noise_strength,
             tiled_sde_noise_boost=tiled_sde_noise_boost,
         )
-        reference = resolve_reference_image(latent, image_ref)
-        if color_match == "reinhard_rgb" and reference is not None:
-            image = match_colors(image, reference)
+        image = _apply_color_match(image, latent, image_ref, color_match)
         return _with_resolution_ui(image)
 
 

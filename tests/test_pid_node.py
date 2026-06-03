@@ -1288,22 +1288,17 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(t_list[0].item(), 0.999)
         self.assertAlmostEqual(t_list[-1].item(), 0.0)
 
-    def test_get_t_list_custom_schedulers(self):
+    def test_get_t_list_ignores_legacy_scheduler_names(self):
         model = self._make_light_model()
         model.config = types.SimpleNamespace(
             student_timestep=1.0,
             student_sample_steps=4,
             student_t_list=None
         )
-        t_uniform = model._get_t_list(device="cpu", num_steps=4, scheduler="uniform")
-        self.assertTrue(torch.allclose(t_uniform, torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0])))
-        t_cosine = model._get_t_list(device="cpu", num_steps=4, scheduler="cosine")
-        self.assertAlmostEqual(t_cosine[0].item(), 1.0)
-        self.assertAlmostEqual(t_cosine[-1].item(), 0.0)
-        t_cosine_2 = model._get_t_list(device="cpu", num_steps=2, scheduler="cosine")
-        self.assertAlmostEqual(t_cosine_2[1].item(), 0.70710678, places=5)
-        t_quad = model._get_t_list(device="cpu", num_steps=4, scheduler="quadratic")
-        self.assertTrue(torch.allclose(t_quad, torch.tensor([1.0, 0.5625, 0.25, 0.0625, 0.0])))
+        expected = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0])
+        for scheduler in ("original", "uniform", "cosine", "quadratic"):
+            t_list = model._get_t_list(device="cpu", num_steps=4, scheduler=scheduler)
+            self.assertTrue(torch.allclose(t_list, expected))
 
     def test_light_model_prefers_native_text_encoder_loader(self):
         clip_text_encoder = DummyComfyClipTextEncoder()
@@ -1914,6 +1909,21 @@ class PiDNodeTests(unittest.TestCase):
         matched = pid_runtime.match_colors(target, reference)
 
         self.assertTrue(torch.allclose(matched, reference, atol=1e-3))
+
+    def test_match_colors_wavelet_accepts_reference_at_source_resolution(self):
+        target = torch.ones((1, 32, 32, 3), dtype=torch.float32) * 0.2
+        reference = torch.ones((1, 8, 8, 3), dtype=torch.float32) * 0.7
+
+        matched = pid_runtime.match_colors(target, reference, method="wavelet")
+
+        self.assertEqual(tuple(matched.shape), tuple(target.shape))
+        self.assertGreater(matched.mean().item(), target.mean().item())
+
+    def test_node_schemas_hide_legacy_scheduler_options(self):
+        for node_cls in (nodes.PiDDecodeLatent, nodes.PiDKSampler, nodes.PiDDecodeLatentTiled):
+            required = node_cls.INPUT_TYPES()["required"]
+            self.assertNotIn("scheduler", required)
+            self.assertEqual(required["color_match"][0], nodes.COLOR_MATCH_OPTIONS)
 
     def test_resolve_reference_image_uses_latent_reference_when_input_is_disconnected(self):
         reference = torch.rand((1, 8, 8, 3), dtype=torch.float32)

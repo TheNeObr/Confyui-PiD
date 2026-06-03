@@ -290,7 +290,7 @@ class _LightPiDModel:
     def _get_t_list(self, device, num_steps: int | None = None, scheduler: str = "original") -> torch.Tensor:
         target_steps = num_steps if num_steps is not None else self.config.student_sample_steps
         student_timestep = float(self.config.student_timestep)
-        if scheduler == "original" and self.config.student_t_list is not None:
+        if self.config.student_t_list is not None:
             full_t = torch.tensor(self.config.student_t_list, device=device, dtype=torch.float32)
             if target_steps != self.config.student_sample_steps:
                 import math
@@ -303,27 +303,6 @@ class _LightPiDModel:
                     t_list[i] = (1.0 - weight) * full_t[idx_l] + weight * full_t[idx_h]
             else:
                 t_list = full_t
-        elif scheduler == "uniform":
-            t_list = torch.linspace(
-                student_timestep,
-                0.0,
-                target_steps + 1,
-                device=device,
-                dtype=torch.float32,
-            )
-        elif scheduler == "cosine":
-            import math
-            t_list = []
-            for i in range(target_steps + 1):
-                t = student_timestep * math.cos((i / target_steps) * (math.pi / 2))
-                t_list.append(t)
-            t_list = torch.tensor(t_list, device=device, dtype=torch.float32)
-        elif scheduler == "quadratic":
-            t_list = []
-            for i in range(target_steps + 1):
-                t = student_timestep * (1.0 - (i / target_steps))**2
-                t_list.append(t)
-            t_list = torch.tensor(t_list, device=device, dtype=torch.float32)
         else:
             t_list = torch.linspace(
                 student_timestep,
@@ -2922,17 +2901,67 @@ def pid_ksampler(
             _set_runtime_net_device(model, "cpu")
 
 
-def match_colors(target: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
-    """Aligns target's channel-wise mean and standard deviation with reference's."""
+def _resize_reference_for_color_match(reference: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if tuple(reference.shape[1:3]) == tuple(target.shape[1:3]):
+        return reference
+    return F.interpolate(
+        reference.permute(0, 3, 1, 2).float(),
+        size=tuple(target.shape[1:3]),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    ).permute(0, 2, 3, 1).to(dtype=reference.dtype)
+
+
+def _low_frequency_color_match(target: torch.Tensor, reference: torch.Tensor, strength: float) -> torch.Tensor:
+    target_cf = target.permute(0, 3, 1, 2).float()
+    reference_cf = reference.permute(0, 3, 1, 2).float()
+    height, width = int(target_cf.shape[-2]), int(target_cf.shape[-1])
+    kernel = max(16, min(height, width) // 32)
+    kernel = min(kernel, max(1, height), max(1, width))
+    if kernel <= 1:
+        return target
+
+    stride = max(1, kernel // 2)
+    padding = kernel // 2
+    target_low = F.avg_pool2d(target_cf, kernel_size=kernel, stride=stride, padding=padding)
+    reference_low = F.avg_pool2d(reference_cf, kernel_size=kernel, stride=stride, padding=padding)
+    correction = reference_low - target_low
+    correction = F.interpolate(
+        correction,
+        size=(height, width),
+        mode="bilinear",
+        align_corners=False,
+    )
+
+    corrected = (target_cf + correction).clamp(0.0, 1.0)
+    out = torch.lerp(target_cf, corrected, max(0.0, min(1.0, float(strength))))
+    return out.permute(0, 2, 3, 1).to(dtype=target.dtype).clamp(0.0, 1.0)
+
+
+def match_colors(target: torch.Tensor, reference: torch.Tensor, method: str = "reinhard_rgb", strength: float = 1.0) -> torch.Tensor:
+    """Aligns target color to a reference while preserving restored detail."""
+    method = str(method or "reinhard_rgb").lower()
+    if method == "disabled":
+        return target
+
     B = target.shape[0]
     C = target.shape[3]
 
     device = target.device
     dtype = target.dtype
     ref = reference.to(device=device, dtype=dtype)
+    ref = _resize_reference_for_color_match(ref, target)
 
     if ref.shape[0] == 1 and B > 1:
         ref = ref.expand(B, -1, -1, -1)
+    elif ref.shape[0] != B:
+        raise ValueError(f"reference precisa ter batch 1 ou {B}, mas recebeu {ref.shape[0]}.")
+
+    if method in ("wavelet", "low_frequency"):
+        return _low_frequency_color_match(target, ref, strength)
+    if method != "reinhard_rgb":
+        raise ValueError(f"Metodo de color_match desconhecido: {method}")
 
     out = target.clone()
     for b in range(B):
@@ -2955,7 +2984,8 @@ def match_colors(target: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
             mask_lo = torch.clamp((threshold_lo - tgt_chan) / threshold_lo, 0.0, 1.0) ** 2
             mask = mask_hi + mask_lo
 
-            out[b, ..., c] = (1.0 - mask) * matched_chan + mask * tgt_chan
+            matched_chan = (1.0 - mask) * matched_chan + mask * tgt_chan
+            out[b, ..., c] = torch.lerp(tgt_chan, matched_chan, max(0.0, min(1.0, float(strength))))
 
     return out.clamp(0.0, 1.0)
 
