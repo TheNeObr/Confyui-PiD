@@ -148,6 +148,7 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 - The backbone selected in `PiD Load Model` must match the latent family.
 - `dinov2` and `siglip` are intentionally not supported in this v2 branch.
 - `flux2` with `checkpoint_variant = 2kto4k` uses the upstream `_2606` checkpoint, which replaced the earlier Flux2 2kto4k weight to fix color drift.
+- `checkpoint_variant = auto` selects the first valid official variant for the chosen backbone. If an older workflow asks for an unsupported variant on a single-variant backbone, the node automatically switches to that backbone's only valid variant instead of failing during generation.
 - `sdxl`, `qwenimage`, and `qwenimage-2512` currently support only the upstream `2kto4k` PiD checkpoint.
 - `zimage` and `zimage-turbo` reuse the official PiD Flux checkpoint and Flux VAE path, matching the upstream alias.
 - `flux2-klein-4b` and `flux2-klein-9b` reuse the official PiD Flux2 checkpoint and Flux2 VAE path, matching the upstream alias.

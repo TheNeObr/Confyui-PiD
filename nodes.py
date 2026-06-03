@@ -8,6 +8,7 @@ from .pid_runtime import (
     encode_image_to_latent,
     encode_prompt,
     load_pid_model,
+    normalize_checkpoint_variant,
     pid_ksampler,
     match_colors,
     resolve_reference_image,
@@ -35,12 +36,12 @@ class PiDLoadModel:
         return {
             "required": {
                 "backbone": (list(SUPPORTED_BACKBONES),),
-                "checkpoint_variant": (list(SUPPORTED_VARIANTS),),
+                "checkpoint_variant": (["auto", *list(SUPPORTED_VARIANTS)], {"default": "auto"}),
             }
         }
 
     def load_model(self, backbone: str, checkpoint_variant: str):
-        return (load_pid_model(backbone, checkpoint_variant),)
+        return (load_pid_model(backbone, normalize_checkpoint_variant(backbone, checkpoint_variant)),)
 
 
 class PiDDecodeLatent:

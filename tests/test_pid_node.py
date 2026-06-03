@@ -882,6 +882,14 @@ class PiDRuntimeTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             get_pid_checkpoint("siglip", "2k")
 
+    def test_checkpoint_variant_auto_and_single_variant_backbones_are_normalized(self):
+        self.assertEqual(pid_runtime.normalize_checkpoint_variant("sdxl", "auto"), "2kto4k")
+        self.assertEqual(pid_runtime.normalize_checkpoint_variant("sdxl", "2k"), "2kto4k")
+        self.assertEqual(pid_runtime.normalize_checkpoint_variant("qwenimage", "2k"), "2kto4k")
+        self.assertEqual(pid_runtime.normalize_checkpoint_variant("flux", "auto"), "2k")
+        with self.assertRaises(ValueError):
+            pid_runtime.normalize_checkpoint_variant("flux", "bad")
+
     def test_group_tile_jobs_by_decode_shape_batches_non_consecutive_matches(self):
         jobs = [
             pid_runtime._ExpandedTileDecodeJob(0, 0, 4, 4, 0, 0, 4, 4, 2, 2, 0, 0),
@@ -1715,6 +1723,15 @@ class PiDNodeTests(unittest.TestCase):
             result = node.load_model("flux", "2k")
 
         patched.assert_called_once_with("flux", "2k")
+        self.assertEqual(result, (sentinel,))
+
+    def test_loader_node_normalizes_single_variant_backbone(self):
+        node = nodes.PiDLoadModel()
+        sentinel = object()
+        with mock.patch.object(nodes, "load_pid_model", return_value=sentinel) as patched:
+            result = node.load_model("sdxl", "2k")
+
+        patched.assert_called_once_with("sdxl", "2kto4k")
         self.assertEqual(result, (sentinel,))
 
     def test_decode_node_delegates_to_runtime(self):

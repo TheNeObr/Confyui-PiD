@@ -542,6 +542,28 @@ def _validate_backbone_variant(backbone: str, ckpt_type: str) -> None:
         raise ValueError(f"Unsupported PiD variant '{ckpt_type}' for backbone '{backbone}'. Valid: {allowed}")
 
 
+def supported_variants_for_backbone(backbone: str) -> tuple[str, ...]:
+    if backbone not in SUPPORTED_BACKBONES:
+        raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
+    return _BACKBONE_VARIANTS.get(backbone, SUPPORTED_VARIANTS)
+
+
+def normalize_checkpoint_variant(backbone: str, ckpt_type: str | None) -> str:
+    allowed = supported_variants_for_backbone(backbone)
+    if ckpt_type in allowed:
+        return str(ckpt_type)
+    if ckpt_type in (None, "", "auto") or len(allowed) == 1:
+        normalized = allowed[0]
+        if ckpt_type not in (None, "", "auto", normalized):
+            print(
+                f"PiD: checkpoint_variant '{ckpt_type}' nao e valido para backbone '{backbone}'. "
+                f"Usando automaticamente '{normalized}'.",
+                flush=True,
+            )
+        return normalized
+    raise ValueError(f"Unsupported PiD variant '{ckpt_type}' for backbone '{backbone}'. Valid: {allowed}")
+
+
 def _asset_patterns(backbone: str, ckpt_type: str) -> list[str]:
     if backbone not in SUPPORTED_BACKBONES:
         raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
@@ -890,7 +912,7 @@ def _ensure_assets(backbone: str, ckpt_type: str) -> None:
 def _prepare_handle(backbone: str, ckpt_type: str) -> PiDHandle:
     if backbone not in SUPPORTED_BACKBONES:
         raise ValueError(f"Unsupported PiD backbone: {backbone!r}")
-    _validate_backbone_variant(backbone, ckpt_type)
+    ckpt_type = normalize_checkpoint_variant(backbone, ckpt_type)
     cache_key = (backbone, ckpt_type)
     cached_handle = _HANDLE_CACHE.get(cache_key)
     if cached_handle is not None:
@@ -1130,7 +1152,7 @@ def _load_runtime(backbone: str, ckpt_type: str) -> tuple[PiDHandle, Any]:
 
 
 def load_pid_model(backbone: str, ckpt_type: str) -> PiDHandle:
-    return _prepare_handle(backbone, ckpt_type)
+    return _prepare_handle(backbone, normalize_checkpoint_variant(backbone, ckpt_type))
 
 
 def _get_model(handle: PiDHandle) -> Any:
