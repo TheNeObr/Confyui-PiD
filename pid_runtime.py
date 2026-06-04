@@ -86,8 +86,8 @@ AUTOENCODE_DEFAULT_TILE_SIZE.update(
         "flux2-klein-9b": 512,
     }
 )
-# Tiles muito pequenos tendem a colapsar a cor no PiD; decodificamos com contexto maior
-# e recortamos o centro para manter a saida pedida sem o desvio verde.
+# Very small PiD tiles tend to collapse color; decode a larger context window
+# and crop the center back to the requested output tile.
 MIN_TILED_DECODE_SIZE = {
     "flux": 512,
     "sd3": 512,
@@ -112,7 +112,9 @@ MIN_TILED_INFERENCE_INPUT_SIZE = {
     "zimage": 512,
     "zimage-turbo": 512,
 }
-TILED_REFERENCE_MOMENT_MATCH_STRENGTH = 0.35
+TILED_REFERENCE_MOMENT_MATCH_STRENGTH = 0.55
+TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_STRENGTH = 0.45
+TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_SIZE = 128
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
@@ -2030,6 +2032,38 @@ def _match_tile_moments_to_reference(
     return torch.lerp(tile_f, matched, strength).to(dtype=tile.dtype)
 
 
+def _anchor_low_frequency_to_reference(
+    prediction: torch.Tensor,
+    reference: torch.Tensor,
+    strength: float = TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_STRENGTH,
+    max_size: int = TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_SIZE,
+) -> torch.Tensor:
+    if prediction.shape != reference.shape or prediction.ndim != 4:
+        return prediction
+    strength = max(0.0, min(1.0, float(strength)))
+    if strength <= 0.0:
+        return prediction
+
+    pred_f = prediction.float()
+    ref_f = reference.to(device=prediction.device, dtype=torch.float32)
+    height = int(pred_f.shape[-2])
+    width = int(pred_f.shape[-1])
+    long_edge = max(height, width)
+    if long_edge <= 0:
+        return prediction
+
+    scale = min(1.0, float(max_size) / float(long_edge))
+    low_h = max(4, int(round(height * scale)))
+    low_w = max(4, int(round(width * scale)))
+    if (low_h, low_w) == (height, width):
+        return torch.lerp(pred_f, ref_f, strength).to(dtype=prediction.dtype)
+
+    pred_low = F.interpolate(pred_f, size=(low_h, low_w), mode="bicubic", align_corners=False)
+    ref_low = F.interpolate(ref_f, size=(low_h, low_w), mode="bicubic", align_corners=False)
+    correction = F.interpolate(ref_low - pred_low, size=(height, width), mode="bicubic", align_corners=False)
+    return (pred_f + correction * strength).to(dtype=prediction.dtype)
+
+
 def _decode_samples(
     handle: PiDHandle,
     latent_tensor: torch.Tensor,
@@ -2456,7 +2490,11 @@ def _decode_samples(
                 tile_progress.update(advance=len(job_window_batch))
 
         tile_progress.update(advance=0, force=True)
-        return x0_global_accum / weight_sum.clamp_min(1e-6)
+        x0_global = x0_global_accum / weight_sum.clamp_min(1e-6)
+        if reference_match_state is not None:
+            reference_global = reference_match_state.to(device=x0_global.device, dtype=x0_global.dtype)
+            x0_global = _anchor_low_frequency_to_reference(x0_global, reference_global)
+        return x0_global
 
     with torch.inference_mode():
         if source_state is not None and source_denoise_strength <= 1e-6:
@@ -2863,7 +2901,7 @@ def decode_latent_tiled(
     sampler: str = "sde",
     scheduler: str = "original",
     sde_noise_strength: float = 1.0,
-    tiled_sde_noise_boost: float = 1.15,
+    tiled_sde_noise_boost: float = 1.0,
     seam_refine: bool = False,
     seam_refine_strength: float = 0.25,
 ) -> torch.Tensor:
@@ -2991,7 +3029,10 @@ def decode_latent_tiled(
                 ((max(output_unit, tile_size - tile_overlap) // 2) // output_unit) * output_unit,
             )
             _pid_console_section("PiD seam refine")
-            _pid_console(f"shifted grid offset: {seam_grid_offset}px | strength: {seam_refine_strength:.2f}", indent=1)
+            _pid_console(
+                f"shifted grid offset: {seam_grid_offset}px | strength: {seam_refine_strength:.2f} | SDE noise: 0.00",
+                indent=1,
+            )
             refine_progress = _DecodeProgress(total=max(1, effective_steps), node_id=unique_id, label="PiD seam refine")
 
             def _refine_preview_callback(step_images: torch.Tensor) -> None:
@@ -3007,12 +3048,12 @@ def decode_latent_tiled(
                 pid_prompt=prompt_value,
                 cfg_scale=cfg_scale,
                 pid_inference_steps=pid_inference_steps,
-                seed=int(seed) + 1,
+                seed=int(seed),
                 degrade_sigma=degrade_sigma,
                 lq_conditioning_boost=lq_conditioning_boost,
                 source_image=_samples_to_image_tensor(samples),
                 source_denoise_strength=seam_refine_strength,
-                source_detail_noise_boost=source_detail_noise_boost,
+                source_detail_noise_boost=0.0,
                 uncond_pid_prompt=uncond_prompt_value,
                 progress=refine_progress,
                 preview_enabled=True,
@@ -3020,7 +3061,7 @@ def decode_latent_tiled(
                 step_preview_callback=_refine_preview_callback,
                 sampler=sampler,
                 scheduler=scheduler,
-                sde_noise_strength=effective_sde_noise_strength,
+                sde_noise_strength=0.0,
                 use_tiled=True,
                 tile_size=tile_size,
                 tile_overlap=tile_overlap,
@@ -3071,7 +3112,7 @@ def pid_ksampler(
     sampler: str = "sde",
     scheduler: str = "original",
     sde_noise_strength: float = 1.0,
-    tiled_sde_noise_boost: float = 1.15,
+    tiled_sde_noise_boost: float = 1.0,
     seam_refine: bool = False,
     seam_refine_strength: float = 0.25,
 ) -> torch.Tensor:
