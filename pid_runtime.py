@@ -1472,6 +1472,22 @@ def _pad_image_tensor(image_tensor: torch.Tensor, geometry: dict[str, int] | Non
     return padded.permute(0, 2, 3, 1).contiguous()
 
 
+def _resize_image_tensor_to_size(
+    image_tensor: torch.Tensor,
+    target_height: int,
+    target_width: int,
+) -> torch.Tensor:
+    if tuple(image_tensor.shape[1:3]) == (int(target_height), int(target_width)):
+        return image_tensor
+    return F.interpolate(
+        image_tensor.permute(0, 3, 1, 2).float(),
+        size=(int(target_height), int(target_width)),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    ).permute(0, 2, 3, 1).to(dtype=image_tensor.dtype).contiguous()
+
+
 def _autocorrect_encode_image_tensor(handle: PiDHandle, image_tensor: torch.Tensor) -> torch.Tensor:
     geometry = _build_encode_image_geometry(handle, image_tensor)
     return _pad_image_tensor(image_tensor, geometry).clamp(0.0, 1.0)
@@ -2103,7 +2119,8 @@ def _decode_samples(
             if tuple(source_state.shape[1:3]) == original_size:
                 source_state = _pad_image_tensor(source_state, source_geometry)
             elif tuple(source_state.shape[1:3]) != aligned_size:
-                source_state = _center_crop_or_pad_image_tensor(source_state, *aligned_size)
+                source_state = _resize_image_tensor_to_size(source_state, *original_size)
+                source_state = _pad_image_tensor(source_state, source_geometry)
         source_state = F.interpolate(
             source_state.permute(0, 3, 1, 2),
             size=(output_h, output_w),

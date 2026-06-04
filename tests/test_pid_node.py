@@ -1684,6 +1684,51 @@ class PiDRuntimeTests(unittest.TestCase):
         ).mul(2.0).sub(1.0)
         self.assertTrue(torch.allclose(samples.squeeze(2), expected.clamp(-1, 1)))
 
+    def test_decode_samples_resizes_mismatched_reference_to_latent_geometry_before_padding(self):
+        model = DummyModel()
+        handle = self._register_runtime(model)
+        prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM), dtype=torch.float32),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="",
+        )
+        source = torch.zeros((1, 2, 2, 3), dtype=torch.float32)
+        source[:, :, 1:, :] = 1.0
+        geometry = {
+            "original_height": 8,
+            "original_width": 8,
+            "aligned_height": 8,
+            "aligned_width": 8,
+            "pad_top": 0,
+            "pad_bottom": 0,
+            "pad_left": 0,
+            "pad_right": 0,
+            "pid_scale": 4,
+        }
+
+        samples = pid_runtime._decode_samples(
+            handle=handle,
+            latent_tensor=torch.zeros((1, 16, 1, 1), dtype=torch.float32),
+            pid_prompt=prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=4,
+            seed=0,
+            degrade_sigma=0.0,
+            source_image=source,
+            source_geometry=geometry,
+            source_denoise_strength=0.0,
+        )
+
+        resized = pid_runtime._resize_image_tensor_to_size(source, 8, 8)
+        expected = torch.nn.functional.interpolate(
+            resized.permute(0, 3, 1, 2),
+            size=(32, 32),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).mul(2.0).sub(1.0)
+        self.assertTrue(torch.allclose(samples.squeeze(2), expected.clamp(-1, 1), atol=1e-5))
+
     def test_decode_samples_source_detail_noise_boost_increases_residual_sde_detail(self):
         class SourceDetailModel(DummyModel):
             def predict_x0(self, x, sigma, caption_embs, attention_mask, lq_latent, degrade_sigma):
