@@ -3092,8 +3092,14 @@ def _low_frequency_color_match(target: torch.Tensor, reference: torch.Tensor, st
 
     stride = max(1, kernel // 2)
     padding = kernel // 2
-    target_low = F.avg_pool2d(target_cf, kernel_size=kernel, stride=stride, padding=padding)
-    reference_low = F.avg_pool2d(reference_cf, kernel_size=kernel, stride=stride, padding=padding)
+    luma_weights = target_cf.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+    target_luma = (target_cf * luma_weights).sum(dim=1, keepdim=True)
+    reference_luma = (reference_cf * luma_weights).sum(dim=1, keepdim=True)
+    target_chroma = target_cf - target_luma
+    reference_chroma = reference_cf - reference_luma
+
+    target_low = F.avg_pool2d(target_chroma, kernel_size=kernel, stride=stride, padding=padding)
+    reference_low = F.avg_pool2d(reference_chroma, kernel_size=kernel, stride=stride, padding=padding)
     correction = reference_low - target_low
     correction = F.interpolate(
         correction,
@@ -3102,7 +3108,9 @@ def _low_frequency_color_match(target: torch.Tensor, reference: torch.Tensor, st
         align_corners=False,
     )
 
-    corrected = (target_cf + correction).clamp(0.0, 1.0)
+    corrected = target_cf + correction
+    corrected_luma = (corrected * luma_weights).sum(dim=1, keepdim=True)
+    corrected = corrected + (target_luma - corrected_luma)
     out = torch.lerp(target_cf, corrected, max(0.0, min(1.0, float(strength))))
     return out.permute(0, 2, 3, 1).to(dtype=target.dtype).clamp(0.0, 1.0)
 

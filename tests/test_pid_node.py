@@ -1966,13 +1966,28 @@ class PiDNodeTests(unittest.TestCase):
         self.assertTrue(torch.allclose(matched, reference, atol=1e-3))
 
     def test_match_colors_wavelet_accepts_reference_at_source_resolution(self):
-        target = torch.ones((1, 32, 32, 3), dtype=torch.float32) * 0.2
-        reference = torch.ones((1, 8, 8, 3), dtype=torch.float32) * 0.7
+        target = torch.ones((1, 32, 32, 3), dtype=torch.float32) * 0.4
+        reference = torch.zeros((1, 8, 8, 3), dtype=torch.float32)
+        reference[..., 0] = 0.8
+        reference[..., 1] = 0.2
+        reference[..., 2] = 0.2
 
         matched = pid_runtime.match_colors(target, reference, method="wavelet")
 
         self.assertEqual(tuple(matched.shape), tuple(target.shape))
-        self.assertGreater(matched.mean().item(), target.mean().item())
+        self.assertGreater(matched[..., 0].mean().item(), matched[..., 2].mean().item())
+
+    def test_match_colors_wavelet_preserves_target_luminance_structure(self):
+        target = torch.ones((1, 32, 32, 3), dtype=torch.float32) * 0.4
+        reference = torch.ones((1, 32, 32, 3), dtype=torch.float32) * 0.4
+        reference[:, 8:24, 8:24, :] = torch.tensor([0.55, 0.35, 0.35], dtype=torch.float32)
+
+        matched = pid_runtime.match_colors(target, reference, method="wavelet")
+        weights = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32)
+        target_luma = (target * weights).sum(dim=-1)
+        matched_luma = (matched * weights).sum(dim=-1)
+
+        self.assertTrue(torch.allclose(matched_luma, target_luma, atol=1e-4))
 
     def test_node_schemas_hide_legacy_scheduler_options(self):
         for node_cls in (nodes.PiDDecodeLatent, nodes.PiDKSampler, nodes.PiDDecodeLatentTiled):
