@@ -103,9 +103,9 @@ MIN_TILED_DECODE_SIZE = {
 MIN_TILED_INFERENCE_INPUT_SIZE = {
     "flux": 512,
     "sd3": 512,
-    "flux2": 512,
-    "flux2-klein-4b": 512,
-    "flux2-klein-9b": 512,
+    "flux2": 256,
+    "flux2-klein-4b": 256,
+    "flux2-klein-9b": 256,
     "sdxl": 512,
     "qwenimage": 512,
     "qwenimage-2512": 512,
@@ -2815,6 +2815,11 @@ def decode_latent_tiled(
         raise ValueError("tile_overlap precisa ser menor que tile_size.")
     if tile_batch_size <= 0:
         raise ValueError("tile_batch_size precisa ser maior que zero.")
+    requested_tile_size = int(tile_size)
+    min_output_tile = int(MIN_TILED_DECODE_SIZE.get(handle.backbone, tile_size))
+    if tile_size < min_output_tile:
+        tile_size = min_output_tile
+        tile_overlap = min(int(tile_overlap), max(0, tile_size - output_unit))
 
     latent_tensor, geom = _prepare_decode_latent(latent, handle)
     latent_dict = {"samples": latent_tensor, LATENT_IMAGE_GEOMETRY_KEY: geom}
@@ -2839,6 +2844,11 @@ def decode_latent_tiled(
     _pid_console(f"latent: {int(latent_tensor.shape[-1])}x{int(latent_tensor.shape[-2])} | aligned input: {aligned_w}x{aligned_h}px", indent=1)
     _pid_console(f"working output: {output_w}x{output_h}px | final crop: {final_w}x{final_h}px", indent=1)
     _pid_console(f"steps: {effective_steps} | cfg: {float(cfg_scale):.2f} | seed: {int(seed)}", indent=1)
+    if tile_size != requested_tile_size:
+        _pid_console(
+            f"tile auto-adjust: requested {requested_tile_size}px -> {tile_size}px for stable {handle.backbone} context",
+            indent=1,
+        )
     _pid_console(f"tile: {int(tile_size)}px | overlap: {int(tile_overlap)}px | tile_batch_size: {int(tile_batch_size)}", indent=1)
     _pid_console(f"seam_refine: {'on' if seam_refine else 'off'} | strength: {float(seam_refine_strength):.2f}", indent=1)
 

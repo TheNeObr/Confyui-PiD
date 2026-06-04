@@ -538,8 +538,8 @@ class PiDRuntimeTests(unittest.TestCase):
             attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
             prompt="cat",
         )
-        primary = torch.zeros((1, 3, 1, 128, 128), dtype=torch.float32)
-        refined = torch.ones((1, 3, 1, 128, 128), dtype=torch.float32)
+        primary = torch.zeros((1, 3, 1, 1024, 1024), dtype=torch.float32)
+        refined = torch.ones((1, 3, 1, 1024, 1024), dtype=torch.float32)
 
         with (
             mock.patch.object(pid_runtime, "_resolve_pid_prompt", return_value=pid_prompt),
@@ -547,15 +547,15 @@ class PiDRuntimeTests(unittest.TestCase):
         ):
             image = pid_runtime.decode_latent_tiled(
                 handle=handle,
-                latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
+                latent={"samples": torch.zeros((1, 16, 32, 32), dtype=torch.float32)},
                 prompt="cat",
                 negative_prompt="",
                 cfg_scale=1.0,
                 pid_inference_steps=4,
                 seed=3,
                 degrade_sigma=0.0,
-                tile_size=64,
-                tile_overlap=32,
+                tile_size=512,
+                tile_overlap=64,
                 tile_batch_size=1,
                 seam_refine=True,
                 seam_refine_strength=0.25,
@@ -563,10 +563,10 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertEqual(patched_decode.call_count, 2)
         refine_kwargs = patched_decode.call_args_list[1].kwargs
-        self.assertEqual(refine_kwargs["tile_grid_offset"], 32)
+        self.assertEqual(refine_kwargs["tile_grid_offset"], 224)
         self.assertAlmostEqual(refine_kwargs["source_denoise_strength"], 0.25)
         self.assertAlmostEqual(image[0, 0, 0, 0].item(), 0.5)
-        self.assertGreater(image[0, 48, 48, 0].item(), 0.5)
+        self.assertGreater(image[0, 300, 300, 0].item(), 0.5)
 
     def test_decode_latent_tiled_batches_same_size_tiles(self):
         model = DummyModel()
@@ -1008,7 +1008,7 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertEqual(expanded.crop_y, (base_job.start_y - expanded.decode_start_y) * 64)
         self.assertEqual(expanded.crop_x, (base_job.start_x - expanded.decode_start_x) * 64)
 
-    def test_flux2_tiled_sampler_expands_to_minimum_model_context(self):
+    def test_flux2_tiled_sampler_auto_raises_small_output_tiles(self):
         model = DummyModel()
         handle = self._register_runtime(model, backbone="flux2", latent_channels=128, latent_compression=16)
 
@@ -1026,8 +1026,8 @@ class PiDRuntimeTests(unittest.TestCase):
             tile_batch_size=1,
         )
 
-        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (32, 32))
-        self.assertEqual(model.call_count, 25)
+        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (16, 16))
+        self.assertEqual(model.call_count, 16)
 
     def test_decode_latent_tiled_validates_tile_alignment(self):
         handle = self._register_runtime(DummyModel(), backbone="flux2", latent_channels=128, latent_compression=16)
