@@ -112,6 +112,7 @@ MIN_TILED_INFERENCE_INPUT_SIZE = {
     "zimage": 512,
     "zimage-turbo": 512,
 }
+TILED_REFERENCE_MOMENT_MATCH_STRENGTH = 0.35
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
@@ -2005,6 +2006,29 @@ def _output_pixels_to_latent_units(value: int, compression: int, pid_scale: int,
     return max(1, int(value) // output_unit)
 
 
+def _match_tile_moments_to_reference(
+    tile: torch.Tensor,
+    reference: torch.Tensor,
+    strength: float = TILED_REFERENCE_MOMENT_MATCH_STRENGTH,
+) -> torch.Tensor:
+    if tile.shape != reference.shape or tile.ndim != 4:
+        return tile
+    strength = max(0.0, min(1.0, float(strength)))
+    if strength <= 0.0:
+        return tile
+
+    tile_f = tile.float()
+    reference_f = reference.to(device=tile.device, dtype=torch.float32)
+    reduce_dims = (-2, -1)
+    tile_mean = tile_f.mean(dim=reduce_dims, keepdim=True)
+    reference_mean = reference_f.mean(dim=reduce_dims, keepdim=True)
+    tile_std = tile_f.std(dim=reduce_dims, keepdim=True).clamp_min(1e-4)
+    reference_std = reference_f.std(dim=reduce_dims, keepdim=True).clamp_min(1e-4)
+    std_ratio = (reference_std / tile_std).clamp(0.65, 1.55)
+    matched = (tile_f - tile_mean) * std_ratio + reference_mean
+    return torch.lerp(tile_f, matched, strength).to(dtype=tile.dtype)
+
+
 def _decode_samples(
     handle: PiDHandle,
     latent_tensor: torch.Tensor,
@@ -2098,37 +2122,46 @@ def _decode_samples(
             raise ValueError(f"Ruido inicial invalido para PiD: esperado {expected_shape}, recebido {tuple(noise.shape)}.")
         noise = noise.to(device=state_device, dtype=precision)
     source_state = None
+    reference_match_state = None
     source_denoise_strength = max(0.0, min(1.0, float(source_denoise_strength)))
-    if source_image is not None and source_denoise_strength < 1.0:
-        source_state = _extract_image_tensor(source_image).to(device=state_device, dtype=torch.float32)
-        if source_state.shape[0] == 1 and batch_size > 1:
-            source_state = source_state.expand(batch_size, -1, -1, -1)
-        elif source_state.shape[0] != batch_size:
+
+    def _prepare_reference_state(image: Any) -> torch.Tensor:
+        prepared = _extract_image_tensor(image).to(device=state_device, dtype=torch.float32)
+        if prepared.shape[0] == 1 and batch_size > 1:
+            prepared = prepared.expand(batch_size, -1, -1, -1)
+        elif prepared.shape[0] != batch_size:
             raise ValueError(
-                f"source_image precisa ter batch 1 ou {batch_size}, mas recebeu {source_state.shape[0]}."
+                f"source_image precisa ter batch 1 ou {batch_size}, mas recebeu {prepared.shape[0]}."
             )
         if source_geometry is not None:
             original_size = (
-                int(source_geometry.get("original_height", source_state.shape[1])),
-                int(source_geometry.get("original_width", source_state.shape[2])),
+                int(source_geometry.get("original_height", prepared.shape[1])),
+                int(source_geometry.get("original_width", prepared.shape[2])),
             )
             aligned_size = (
-                int(source_geometry.get("aligned_height", source_state.shape[1])),
-                int(source_geometry.get("aligned_width", source_state.shape[2])),
+                int(source_geometry.get("aligned_height", prepared.shape[1])),
+                int(source_geometry.get("aligned_width", prepared.shape[2])),
             )
-            if tuple(source_state.shape[1:3]) == original_size:
-                source_state = _pad_image_tensor(source_state, source_geometry)
-            elif tuple(source_state.shape[1:3]) != aligned_size:
-                source_state = _resize_image_tensor_to_size(source_state, *original_size)
-                source_state = _pad_image_tensor(source_state, source_geometry)
-        source_state = F.interpolate(
-            source_state.permute(0, 3, 1, 2),
+            if tuple(prepared.shape[1:3]) == original_size:
+                prepared = _pad_image_tensor(prepared, source_geometry)
+            elif tuple(prepared.shape[1:3]) != aligned_size:
+                prepared = _resize_image_tensor_to_size(prepared, *original_size)
+                prepared = _pad_image_tensor(prepared, source_geometry)
+        prepared = F.interpolate(
+            prepared.permute(0, 3, 1, 2),
             size=(output_h, output_w),
             mode="bicubic",
             align_corners=False,
             antialias=True,
         ).clamp(0.0, 1.0)
-        source_state = source_state.mul(2.0).sub(1.0).to(dtype=precision)
+        return prepared.mul(2.0).sub(1.0).to(dtype=precision)
+
+    if source_image is not None and (source_denoise_strength < 1.0 or use_tiled):
+        prepared_reference_state = _prepare_reference_state(source_image)
+        if source_denoise_strength < 1.0:
+            source_state = prepared_reference_state
+        if use_tiled:
+            reference_match_state = prepared_reference_state
     autocast_ctx = torch.autocast("cuda", dtype=model.autocast_dtype) if getattr(model, "autocast_dtype", None) else nullcontext()
     net = model.net
     net.eval()
@@ -2382,6 +2415,14 @@ def _decode_samples(
 
                         tile_h = int(tile_x0_cropped.shape[2])
                         tile_w = int(tile_x0_cropped.shape[3])
+                        if reference_match_state is not None:
+                            reference_tile = reference_match_state[
+                                :,
+                                :,
+                                job.out_y : job.out_y + tile_h,
+                                job.out_x : job.out_x + tile_w,
+                            ].to(device=tile_x0_cropped.device, dtype=tile_x0_cropped.dtype)
+                            tile_x0_cropped = _match_tile_moments_to_reference(tile_x0_cropped, reference_tile)
 
                         weight_key = (
                             tile_h,

@@ -1008,6 +1008,17 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertEqual(len(grouped), 1)
         self.assertEqual(grouped[0], jobs)
 
+    def test_match_tile_moments_to_reference_softens_tile_color_drift(self):
+        tile = torch.ones((1, 3, 8, 8), dtype=torch.float32) * 0.8
+        reference = torch.ones((1, 3, 8, 8), dtype=torch.float32) * 0.2
+
+        matched = pid_runtime._match_tile_moments_to_reference(tile, reference, strength=0.5)
+
+        self.assertEqual(tuple(matched.shape), tuple(tile.shape))
+        self.assertEqual(matched.dtype, tile.dtype)
+        self.assertLess(matched.mean().item(), tile.mean().item())
+        self.assertGreater(matched.mean().item(), reference.mean().item())
+
     def test_small_tiled_decode_expands_context_window(self):
         base_job = pid_runtime._TileDecodeJob(start_y=32, start_x=32, end_y=64, end_x=64, out_y=1024, out_x=1024)
         expanded = pid_runtime._expand_tile_job(
