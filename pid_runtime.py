@@ -1417,10 +1417,10 @@ def _build_encode_image_geometry(handle: PiDHandle, image_tensor: torch.Tensor) 
         "original_width": width,
         "aligned_height": target_height,
         "aligned_width": target_width,
-        "pad_top": pad_h // 2,
-        "pad_bottom": pad_h - (pad_h // 2),
-        "pad_left": pad_w // 2,
-        "pad_right": pad_w - (pad_w // 2),
+        "pad_top": 0,
+        "pad_bottom": pad_h,
+        "pad_left": 0,
+        "pad_right": pad_w,
         "pid_scale": int(handle.pid_scale),
     }
 
@@ -2688,10 +2688,10 @@ def _build_decode_geometry_from_reference(
         "original_width": original_width,
         "aligned_height": aligned_height,
         "aligned_width": aligned_width,
-        "pad_top": pad_h // 2,
-        "pad_bottom": pad_h - (pad_h // 2),
-        "pad_left": pad_w // 2,
-        "pad_right": pad_w - (pad_w // 2),
+        "pad_top": 0,
+        "pad_bottom": pad_h,
+        "pad_left": 0,
+        "pad_right": pad_w,
         "pid_scale": handle.pid_scale,
     }
 

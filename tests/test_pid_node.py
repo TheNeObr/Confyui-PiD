@@ -299,8 +299,8 @@ class PiDRuntimeTests(unittest.TestCase):
                 "original_width": 95,
                 "aligned_height": 96,
                 "aligned_width": 96,
-                "pad_top": 13,
-                "pad_bottom": 13,
+                "pad_top": 0,
+                "pad_bottom": 26,
                 "pad_left": 0,
                 "pad_right": 1,
                 "pid_scale": 4,
@@ -340,9 +340,8 @@ class PiDRuntimeTests(unittest.TestCase):
         corrected = pid_runtime._autocorrect_encode_image_tensor(handle, image)
 
         self.assertEqual(tuple(corrected.shape), (1, 96, 96, 3))
-        self.assertTrue(torch.equal(corrected[:, 13:83, :95, :], image))
-        self.assertTrue(torch.equal(corrected[:, :13, :95, :], image[:, :1, :, :].expand(-1, 13, -1, -1)))
-        self.assertTrue(torch.equal(corrected[:, 83:96, :95, :], image[:, 69:70, :, :].expand(-1, 13, -1, -1)))
+        self.assertTrue(torch.equal(corrected[:, :70, :95, :], image))
+        self.assertTrue(torch.equal(corrected[:, 70:96, :95, :], image[:, 69:70, :, :].expand(-1, 26, -1, -1)))
         self.assertTrue(torch.equal(corrected[:, :, 95:96, :], corrected[:, :, 94:95, :]))
 
     def test_decode_latent_restores_original_output_geometry_after_encode_padding(self):
@@ -355,8 +354,8 @@ class PiDRuntimeTests(unittest.TestCase):
                 "original_width": 95,
                 "aligned_height": 96,
                 "aligned_width": 96,
-                "pad_top": 13,
-                "pad_bottom": 13,
+                "pad_top": 0,
+                "pad_bottom": 26,
                 "pad_left": 0,
                 "pad_right": 1,
                 "pid_scale": 4,
@@ -456,8 +455,8 @@ class PiDRuntimeTests(unittest.TestCase):
                     "original_width": 95,
                     "aligned_height": 96,
                     "aligned_width": 96,
-                    "pad_top": 13,
-                    "pad_bottom": 13,
+                    "pad_top": 0,
+                    "pad_bottom": 26,
                     "pad_left": 0,
                     "pad_right": 1,
                     "pid_scale": 4,
@@ -1655,8 +1654,8 @@ class PiDRuntimeTests(unittest.TestCase):
             "original_width": 4,
             "aligned_height": 4,
             "aligned_width": 4,
-            "pad_top": 1,
-            "pad_bottom": 1,
+            "pad_top": 0,
+            "pad_bottom": 2,
             "pad_left": 0,
             "pad_right": 0,
             "pid_scale": 4,
