@@ -100,6 +100,18 @@ MIN_TILED_DECODE_SIZE = {
     "zimage": 512,
     "zimage-turbo": 512,
 }
+MIN_TILED_INFERENCE_INPUT_SIZE = {
+    "flux": 512,
+    "sd3": 512,
+    "flux2": 512,
+    "flux2-klein-4b": 512,
+    "flux2-klein-9b": 512,
+    "sdxl": 512,
+    "qwenimage": 512,
+    "qwenimage-2512": 512,
+    "zimage": 512,
+    "zimage-turbo": 512,
+}
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
@@ -2125,10 +2137,12 @@ def _decode_samples(
         actual_overlap_y = (tile_latent - (starts_y[1] - starts_y[0])) * compression * handle.pid_scale if len(starts_y) > 1 else 0
         actual_overlap_x = (tile_latent - (starts_x[1] - starts_x[0])) * compression * handle.pid_scale if len(starts_x) > 1 else 0
 
-        # The configured tile size is the output-space VRAM contract, mirroring
-        # SeedVR2's VAE tiling semantics. Do not expand it back to a larger
-        # input-space window, or 512px tiles silently become 2K pixel diffusion.
-        min_size = max(1, tile_size // handle.pid_scale)
+        # The configured tile size controls the output region we commit back to
+        # the canvas, but PiD still needs enough LQ context inside the model
+        # window. Very small input windows (for example 192px from a 768px
+        # output tile at x4) produce noisy, fragmented restorations.
+        output_tile_input_size = max(1, tile_size // handle.pid_scale)
+        min_size = max(output_tile_input_size, int(MIN_TILED_INFERENCE_INPUT_SIZE.get(handle.backbone, 512)))
         tile_jobs = _iter_tile_jobs(
             latent_tensor,
             compression,
@@ -2162,6 +2176,7 @@ def _decode_samples(
             f"pixel diffusion max: {max_window_w * handle.pid_scale}x{max_window_h * handle.pid_scale}px",
             indent=2,
         )
+        _pid_console(f"context min: {min_size}x{min_size}px input | output commit keeps the requested tile", indent=2)
         _pid_console(f"grid offset: {grid_offset_latent * compression * handle.pid_scale}px | global state: cpu", indent=2)
         weight_cache_cpu = {}
 

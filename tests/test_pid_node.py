@@ -441,7 +441,7 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertEqual(tuple(image.shape), (1, 128, 128, 3))
         self.assertTrue(torch.allclose(image, torch.ones_like(image)))
-        self.assertEqual(model.call_count, 36)
+        self.assertEqual(model.call_count, 4)
 
     def test_decode_latent_tiled_restores_original_output_geometry_after_encode_padding(self):
         model = DummyModel()
@@ -495,7 +495,7 @@ class PiDRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(tuple(image.shape), (1, 128, 192, 3))
-        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (2, 2))
+        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (4, 6))
 
     def test_decode_latent_tiled_applies_sde_noise_boost(self):
         handle = self._register_runtime(DummyModel())
@@ -1008,7 +1008,7 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertEqual(expanded.crop_y, (base_job.start_y - expanded.decode_start_y) * 64)
         self.assertEqual(expanded.crop_x, (base_job.start_x - expanded.decode_start_x) * 64)
 
-    def test_flux2_tiled_sampler_keeps_requested_inference_window(self):
+    def test_flux2_tiled_sampler_expands_to_minimum_model_context(self):
         model = DummyModel()
         handle = self._register_runtime(model, backbone="flux2", latent_channels=128, latent_compression=16)
 
@@ -1026,8 +1026,8 @@ class PiDRuntimeTests(unittest.TestCase):
             tile_batch_size=1,
         )
 
-        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (8, 8))
-        self.assertEqual(model.call_count, 49)
+        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (32, 32))
+        self.assertEqual(model.call_count, 25)
 
     def test_decode_latent_tiled_validates_tile_alignment(self):
         handle = self._register_runtime(DummyModel(), backbone="flux2", latent_channels=128, latent_compression=16)
