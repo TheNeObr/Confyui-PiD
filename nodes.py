@@ -198,7 +198,7 @@ class PiDKSampler:
                 "source_detail_noise_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
                 "keep_model_loaded_on_gpu": ("BOOLEAN", {"default": True}),
                 "use_tiled": ("BOOLEAN", {"default": False}),
-                "tile_size": ("INT", {"default": 256, "min": 64, "max": 2048, "step": 64}),
+                "tile_size": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64}),
                 "tile_overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8}),
                 "tile_batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
                 "seam_refine": ("BOOLEAN", {"default": False}),
@@ -290,7 +290,7 @@ class PiDDecodeLatentTiled:
             "required": {
                 "pid_model": ("PID_MODEL",),
                 "latent": ("LATENT",),
-                "tile_size": ("INT", {"default": 256, "min": 64, "max": 2048, "step": 64}),
+                "tile_size": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64}),
                 "tile_overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8}),
                 "tile_batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
                 "seam_refine": ("BOOLEAN", {"default": False}),

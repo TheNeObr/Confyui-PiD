@@ -1929,6 +1929,16 @@ def _expand_tile_job(
     )
 
 
+def _output_pixels_to_latent_units(value: int, compression: int, pid_scale: int, name: str) -> int:
+    output_unit = max(1, int(compression) * int(pid_scale))
+    if value % output_unit != 0:
+        raise ValueError(
+            f"{name} precisa ser multiplo de {output_unit} px "
+            f"(compression {compression} x scale {pid_scale})."
+        )
+    return max(1, int(value) // output_unit)
+
+
 def _decode_samples(
     handle: PiDHandle,
     latent_tensor: torch.Tensor,
@@ -2058,9 +2068,10 @@ def _decode_samples(
 
     if use_tiled:
         compression = handle.latent_compression
-        tile_latent = tile_size // compression
-        overlap_latent = tile_overlap // compression
-        grid_offset_latent = max(0, int(tile_grid_offset) // compression)
+        tile_latent = _output_pixels_to_latent_units(tile_size, compression, handle.pid_scale, "tile_size")
+        overlap_latent = 0 if tile_overlap <= 0 else _output_pixels_to_latent_units(tile_overlap, compression, handle.pid_scale, "tile_overlap")
+        overlap_latent = min(overlap_latent, max(0, tile_latent - 1))
+        grid_offset_latent = max(0, int(tile_grid_offset) // (compression * handle.pid_scale))
         starts_y = _compute_shifted_tile_starts(
             int(latent_tensor.shape[-2]),
             tile_latent,
@@ -2076,10 +2087,10 @@ def _decode_samples(
         actual_overlap_y = (tile_latent - (starts_y[1] - starts_y[0])) * compression * handle.pid_scale if len(starts_y) > 1 else 0
         actual_overlap_x = (tile_latent - (starts_x[1] - starts_x[0])) * compression * handle.pid_scale if len(starts_x) > 1 else 0
 
-        # The configured tile size is the VRAM contract for tiled sampling.
-        # Expanding FLUX2 tiles to its direct-decode minimum defeats tiling and
-        # can turn a requested 512 window back into a costly 1024 inference.
-        min_size = tile_size
+        # The configured tile size is the output-space VRAM contract, mirroring
+        # SeedVR2's VAE tiling semantics. Do not expand it back to a larger
+        # input-space window, or 512px tiles silently become 2K pixel diffusion.
+        min_size = max(1, tile_size // handle.pid_scale)
         tile_jobs = _iter_tile_jobs(
             latent_tensor,
             compression,
@@ -2107,9 +2118,13 @@ def _decode_samples(
         max_window_w = max(job.decode_end_x - job.decode_start_x for job in expanded_jobs) * compression
         _pid_console("Tiled execution plan", indent=1)
         _pid_console(f"tiles: {len(tile_jobs)} | unique windows: {unique_window_count}", indent=2)
-        _pid_console(f"tile: {tile_size}x{tile_size} | overlap: {tile_overlap}px | batch: {tile_batch_size}", indent=2)
-        _pid_console(f"max inference window: {max_window_w}x{max_window_h}px", indent=2)
-        _pid_console(f"grid offset: {grid_offset_latent * compression}px | global state: cpu", indent=2)
+        _pid_console(f"output tile: {tile_size}x{tile_size}px | overlap: {tile_overlap}px | batch: {tile_batch_size}", indent=2)
+        _pid_console(
+            f"latent tile: {tile_latent}x{tile_latent} | input window max: {max_window_w}x{max_window_h}px | "
+            f"pixel diffusion max: {max_window_w * handle.pid_scale}x{max_window_h * handle.pid_scale}px",
+            indent=2,
+        )
+        _pid_console(f"grid offset: {grid_offset_latent * compression * handle.pid_scale}px | global state: cpu", indent=2)
         weight_cache_cpu = {}
 
     def _get_downsampled_preview(x0: torch.Tensor) -> torch.Tensor:
@@ -2738,10 +2753,13 @@ def decode_latent_tiled(
     seam_refine_strength: float = 0.25,
 ) -> torch.Tensor:
     compression = handle.latent_compression
-    if tile_size % compression != 0:
-        raise ValueError(f"tile_size precisa ser multiplo de {compression} para o backbone '{handle.backbone}'.")
-    if tile_overlap % compression != 0:
-        raise ValueError(f"tile_overlap precisa ser multiplo de {compression} para o backbone '{handle.backbone}'.")
+    output_unit = compression * handle.pid_scale
+    if tile_size % output_unit != 0:
+        raise ValueError(f"tile_size precisa ser multiplo de {output_unit} px para o backbone '{handle.backbone}'.")
+    if tile_overlap % output_unit != 0:
+        raise ValueError(f"tile_overlap precisa ser multiplo de {output_unit} px para o backbone '{handle.backbone}'.")
+    if tile_overlap >= tile_size:
+        raise ValueError("tile_overlap precisa ser menor que tile_size.")
     if tile_batch_size <= 0:
         raise ValueError("tile_batch_size precisa ser maior que zero.")
 
@@ -2828,8 +2846,9 @@ def decode_latent_tiled(
     )
 
     if seam_refine:
-        tile_latent = tile_size // compression
-        overlap_latent = tile_overlap // compression
+        tile_latent = _output_pixels_to_latent_units(tile_size, compression, handle.pid_scale, "tile_size")
+        overlap_latent = 0 if tile_overlap <= 0 else _output_pixels_to_latent_units(tile_overlap, compression, handle.pid_scale, "tile_overlap")
+        overlap_latent = min(overlap_latent, max(0, tile_latent - 1))
         seam_mask = _make_seam_refine_mask(
             latent_h=int(latent_tensor.shape[-2]),
             latent_w=int(latent_tensor.shape[-1]),
@@ -2841,8 +2860,8 @@ def decode_latent_tiled(
         if seam_mask.max().item() > 0.0:
             seam_refine_strength = max(0.0, min(1.0, float(seam_refine_strength)))
             seam_grid_offset = max(
-                compression,
-                ((max(compression, tile_size - tile_overlap) // 2) // compression) * compression,
+                output_unit,
+                ((max(output_unit, tile_size - tile_overlap) // 2) // output_unit) * output_unit,
             )
             _pid_console_section("PiD seam refine")
             _pid_console(f"shifted grid offset: {seam_grid_offset}px | strength: {seam_refine_strength:.2f}", indent=1)

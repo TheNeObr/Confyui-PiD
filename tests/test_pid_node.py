@@ -400,8 +400,8 @@ class PiDRuntimeTests(unittest.TestCase):
             pid_inference_steps=4,
             seed=0,
             degrade_sigma=0.0,
-            tile_size=32,
-            tile_overlap=8,
+            tile_size=64,
+            tile_overlap=32,
             tile_batch_size=1,
         )
 
@@ -420,8 +420,8 @@ class PiDRuntimeTests(unittest.TestCase):
             pid_inference_steps=4,
             seed=3,
             degrade_sigma=0.0,
-            tile_size=16,
-            tile_overlap=8,
+            tile_size=64,
+            tile_overlap=32,
             tile_batch_size=1,
         )
 
@@ -455,8 +455,8 @@ class PiDRuntimeTests(unittest.TestCase):
             pid_inference_steps=4,
             seed=3,
             degrade_sigma=0.0,
-            tile_size=32,
-            tile_overlap=8,
+            tile_size=64,
+            tile_overlap=32,
             tile_batch_size=1,
         )
 
@@ -475,8 +475,8 @@ class PiDRuntimeTests(unittest.TestCase):
             pid_inference_steps=4,
             seed=3,
             degrade_sigma=0.0,
-            tile_size=16,
-            tile_overlap=8,
+            tile_size=64,
+            tile_overlap=32,
             tile_batch_size=1,
         )
 
@@ -508,8 +508,8 @@ class PiDRuntimeTests(unittest.TestCase):
                 pid_inference_steps=4,
                 seed=3,
                 degrade_sigma=0.0,
-                tile_size=16,
-                tile_overlap=8,
+                tile_size=64,
+                tile_overlap=32,
                 tile_batch_size=1,
                 sde_noise_strength=1.0,
                 tiled_sde_noise_boost=1.35,
@@ -540,8 +540,8 @@ class PiDRuntimeTests(unittest.TestCase):
                 pid_inference_steps=4,
                 seed=3,
                 degrade_sigma=0.0,
-                tile_size=16,
-                tile_overlap=8,
+                tile_size=64,
+                tile_overlap=32,
                 tile_batch_size=1,
                 seam_refine=True,
                 seam_refine_strength=0.25,
@@ -549,7 +549,7 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertEqual(patched_decode.call_count, 2)
         refine_kwargs = patched_decode.call_args_list[1].kwargs
-        self.assertEqual(refine_kwargs["tile_grid_offset"], 8)
+        self.assertEqual(refine_kwargs["tile_grid_offset"], 32)
         self.assertAlmostEqual(refine_kwargs["source_denoise_strength"], 0.25)
         self.assertAlmostEqual(image[0, 0, 0, 0].item(), 0.5)
         self.assertGreater(image[0, 48, 48, 0].item(), 0.5)
@@ -567,8 +567,8 @@ class PiDRuntimeTests(unittest.TestCase):
             pid_inference_steps=4,
             seed=3,
             degrade_sigma=0.0,
-            tile_size=16,
-            tile_overlap=8,
+            tile_size=64,
+            tile_overlap=32,
             tile_batch_size=4,
         )
 
@@ -603,8 +603,8 @@ class PiDRuntimeTests(unittest.TestCase):
                 pid_inference_steps=4,
                 seed=3,
                 degrade_sigma=0.0,
-                tile_size=16,
-                tile_overlap=8,
+                tile_size=64,
+                tile_overlap=32,
                 tile_batch_size=1,
             )
 
@@ -645,8 +645,8 @@ class PiDRuntimeTests(unittest.TestCase):
                 pid_inference_steps=4,
                 seed=3,
                 degrade_sigma=0.0,
-                tile_size=16,
-                tile_overlap=8,
+                tile_size=64,
+                tile_overlap=32,
                 tile_batch_size=2,
             )
 
@@ -681,8 +681,8 @@ class PiDRuntimeTests(unittest.TestCase):
                 pid_inference_steps=4,
                 seed=3,
                 degrade_sigma=0.0,
-                tile_size=16,
-                tile_overlap=8,
+                tile_size=64,
+                tile_overlap=32,
                 tile_batch_size=1,
             )
 
@@ -1012,8 +1012,8 @@ class PiDRuntimeTests(unittest.TestCase):
             tile_batch_size=1,
         )
 
-        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (32, 32))
-        self.assertEqual(model.call_count, 4)
+        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (8, 8))
+        self.assertEqual(model.call_count, 49)
 
     def test_decode_latent_tiled_validates_tile_alignment(self):
         handle = self._register_runtime(DummyModel(), backbone="flux2", latent_channels=128, latent_compression=16)
@@ -1048,8 +1048,8 @@ class PiDRuntimeTests(unittest.TestCase):
             degrade_sigma=0.0,
             keep_model_loaded_on_gpu=True,
             use_tiled=True,
-            tile_size=16,
-            tile_overlap=8,
+            tile_size=64,
+            tile_overlap=32,
             tile_batch_size=2,
         )
 
@@ -1725,7 +1725,7 @@ class PiDRuntimeTests(unittest.TestCase):
             degrade_sigma=0.0,
             sde_noise_strength=0.5,
             use_tiled=True,
-            tile_size=8,
+            tile_size=32,
             tile_overlap=0,
         )
 
