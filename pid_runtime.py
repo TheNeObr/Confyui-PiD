@@ -2881,9 +2881,11 @@ def decode_latent_tiled(
             preview_tuple = None
         progress.update(advance=1, preview=preview_tuple, emit_bar=True)
 
-    effective_sde_noise_strength = float(sde_noise_strength) * float(tiled_sde_noise_boost)
+    tiled_sde_multiplier = float(tiled_sde_noise_boost) if float(tiled_sde_noise_boost) > 0.0 else 1.0
+    effective_sde_noise_strength = float(sde_noise_strength) * tiled_sde_multiplier
     _pid_console(
-        f"SDE noise: base={float(sde_noise_strength):.2f} | boost={float(tiled_sde_noise_boost):.2f} | "
+        f"SDE noise: base={float(sde_noise_strength):.2f} | boost={float(tiled_sde_noise_boost):.2f} "
+        f"(x{tiled_sde_multiplier:.2f}) | "
         f"effective={effective_sde_noise_strength:.2f}",
         indent=1,
     )

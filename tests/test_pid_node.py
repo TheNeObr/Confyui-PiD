@@ -530,6 +530,40 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertAlmostEqual(patched_decode.call_args.kwargs["sde_noise_strength"], 1.35)
 
+    def test_decode_latent_tiled_zero_sde_boost_keeps_base_sde_strength(self):
+        handle = self._register_runtime(DummyModel())
+        pid_prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM)),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="cat",
+        )
+
+        with (
+            mock.patch.object(pid_runtime, "_resolve_pid_prompt", return_value=pid_prompt),
+            mock.patch.object(
+                pid_runtime,
+                "_decode_samples",
+                return_value=torch.ones((1, 3, 1, 128, 128), dtype=torch.float32),
+            ) as patched_decode,
+        ):
+            pid_runtime.decode_latent_tiled(
+                handle=handle,
+                latent={"samples": torch.zeros((1, 16, 4, 4), dtype=torch.float32)},
+                prompt="cat",
+                negative_prompt="",
+                cfg_scale=1.0,
+                pid_inference_steps=4,
+                seed=3,
+                degrade_sigma=0.0,
+                tile_size=64,
+                tile_overlap=32,
+                tile_batch_size=1,
+                sde_noise_strength=1.0,
+                tiled_sde_noise_boost=0.0,
+            )
+
+        self.assertAlmostEqual(patched_decode.call_args.kwargs["sde_noise_strength"], 1.0)
+
     def test_decode_latent_tiled_refines_seams_with_shifted_second_pass(self):
         handle = self._register_runtime(DummyModel())
         pid_prompt = pid_runtime.PiDPrompt(
