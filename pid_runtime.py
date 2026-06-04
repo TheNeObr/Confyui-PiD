@@ -379,6 +379,7 @@ class _NativePiDModel(_LightPiDModel):
 class _DecodeProgress:
     total: int
     node_id: str | None = None
+    label: str = "PiD KSampler"
     current: int = 0
 
     def __post_init__(self):
@@ -428,7 +429,7 @@ class _DecodeProgress:
                 else f"{eta_minutes:02d}:{eta_secs:02d}"
             )
         line = (
-            f"\rPiD KSampler [{bar}] "
+            f"\r{self.label} [{bar}] "
             f"{self.current}/{self.total} steps "
             f"({progress_ratio * 100:5.1f}%) "
             f"{iterations_per_second:5.2f} it/s "
@@ -468,6 +469,68 @@ class _DecodeProgress:
         if emit_bar and preview is not None:
             self._send_legacy_preview(preview)
 
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--"
+    total_seconds = max(0, int(round(float(seconds))))
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def _pid_console(message: str = "", *, indent: int = 0, end: str = "\n") -> None:
+    stream = getattr(sys, "stderr", None)
+    if stream is None or not hasattr(stream, "write"):
+        return
+    prefix = "[PiD] " if indent <= 0 else "[PiD] " + ("  " * indent)
+    stream.write(prefix + message + end)
+    if hasattr(stream, "flush"):
+        stream.flush()
+
+
+def _pid_console_section(title: str) -> None:
+    _pid_console("")
+    _pid_console(f"━━━━━━━━ {title} ━━━━━━━━")
+
+
+class _TileConsoleProgress:
+    def __init__(self, *, label: str, total: int):
+        self.label = label
+        self.total = max(1, int(total))
+        self.current = 0
+        self.started_at = time.perf_counter()
+        self._last_render_at = 0.0
+        self._finished = False
+
+    def update(self, advance: int = 1, *, force: bool = False) -> None:
+        if self._finished:
+            return
+        self.current = min(self.total, self.current + max(0, int(advance)))
+        now = time.perf_counter()
+        is_final = self.current >= self.total
+        if not force and not is_final and (now - self._last_render_at) < 0.25:
+            return
+        elapsed = max(now - self.started_at, 1e-6)
+        rate = self.current / elapsed if self.current else 0.0
+        eta = ((self.total - self.current) / rate) if rate > 1e-6 else None
+        ratio = self.current / self.total
+        filled = min(20, int(round(ratio * 20)))
+        bar = "#" * filled + "-" * (20 - filled)
+        stream = getattr(sys, "stderr", None)
+        if stream is None or not hasattr(stream, "write"):
+            return
+        stream.write(
+            f"\r[PiD]   {self.label} [{bar}] "
+            f"{self.current}/{self.total} windows "
+            f"({ratio * 100:5.1f}%) {rate:5.2f} win/s ETA {_format_duration(eta)}"
+        )
+        if is_final:
+            stream.write("\n")
+            self._finished = True
+        if hasattr(stream, "flush"):
+            stream.flush()
+        self._last_render_at = now
 
 @dataclass(frozen=True)
 class _TileDecodeJob:
@@ -2042,12 +2105,11 @@ def _decode_samples(
         unique_window_count = sum(len(group) for group in grouped_job_windows)
         max_window_h = max(job.decode_end_y - job.decode_start_y for job in expanded_jobs) * compression
         max_window_w = max(job.decode_end_x - job.decode_start_x for job in expanded_jobs) * compression
-        print(
-            f"PiD tiled plan: {len(tile_jobs)} tiles, {unique_window_count} unique windows, "
-            f"max inference window {max_window_w}x{max_window_h}, tile_batch_size={tile_batch_size}, "
-            f"grid_offset={grid_offset_latent * compression}, global state=cpu.",
-            flush=True,
-        )
+        _pid_console("Tiled execution plan", indent=1)
+        _pid_console(f"tiles: {len(tile_jobs)} | unique windows: {unique_window_count}", indent=2)
+        _pid_console(f"tile: {tile_size}x{tile_size} | overlap: {tile_overlap}px | batch: {tile_batch_size}", indent=2)
+        _pid_console(f"max inference window: {max_window_w}x{max_window_h}px", indent=2)
+        _pid_console(f"grid offset: {grid_offset_latent * compression}px | global state: cpu", indent=2)
         weight_cache_cpu = {}
 
     def _get_downsampled_preview(x0: torch.Tensor) -> torch.Tensor:
@@ -2109,9 +2171,10 @@ def _decode_samples(
         v_uncond = _predict_velocity_direct(x_in, t_scaled, uncond_caption_embs)
         return v_uncond + cfg_scale * (v_cond - v_uncond)
 
-    def _predict_x0_cfg_tiled(x_global: torch.Tensor, t_cur_batch: torch.Tensor) -> torch.Tensor:
+    def _predict_x0_cfg_tiled(x_global: torch.Tensor, t_cur_batch: torch.Tensor, step_label: str = "step") -> torch.Tensor:
         x0_global_accum = torch.zeros_like(x_global, device="cpu", dtype=torch.float32)
         weight_sum = torch.zeros((batch_size, 1, output_h, output_w), device="cpu", dtype=torch.float32)
+        tile_progress = _TileConsoleProgress(label=f"{step_label} tiles", total=unique_window_count)
 
         for job_window_group in grouped_job_windows:
             group_index = 0
@@ -2263,7 +2326,9 @@ def _decode_samples(
                         weight_cf = weight.permute(0, 3, 1, 2)
                         x0_global_accum[:, :, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w] += tile_x0_cropped * weight_cf
                         weight_sum[:, :, job.out_y : job.out_y + tile_h, job.out_x : job.out_x + tile_w] += weight_cf
+                tile_progress.update(advance=len(job_window_batch))
 
+        tile_progress.update(advance=0, force=True)
         return x0_global_accum / weight_sum.clamp_min(1e-6)
 
     with torch.inference_mode():
@@ -2285,7 +2350,7 @@ def _decode_samples(
             if source_state is not None:
                 noise = (1.0 - effective_timestep) * source_state + effective_timestep * noise
             if use_tiled:
-                x0_student = _predict_x0_cfg_tiled(noise, t_student)
+                x0_student = _predict_x0_cfg_tiled(noise, t_student, "step 1/1")
             else:
                 if hasattr(model, "predict_x0"):
                     x0_student = _predict_x0_cfg(noise, t_student)
@@ -2317,7 +2382,7 @@ def _decode_samples(
                 for step_idx, (t_cur, t_next) in enumerate(zip(t_list[:-1], t_list[1:])):
                     t_cur_batch = t_cur.expand(batch_size)
                     if use_tiled:
-                        x0_pred = _predict_x0_cfg_tiled(x, t_cur_batch)
+                        x0_pred = _predict_x0_cfg_tiled(x, t_cur_batch, f"step {step_idx + 1}/{effective_steps}")
                         t_shape = [batch_size] + [1] * (x.ndim - 1)
                         t_cur_state = t_cur_batch.to(device=x.device, dtype=torch.float64)
                         v_pred = ((x.double() - x0_pred.double()) / t_cur_state.view(*t_shape).clamp(min=5e-2)).to(x.dtype)
@@ -2682,6 +2747,13 @@ def decode_latent_tiled(
 
     latent_tensor, geom = _prepare_decode_latent(latent, handle)
     latent_dict = {"samples": latent_tensor, LATENT_IMAGE_GEOMETRY_KEY: geom}
+    started_at = time.perf_counter()
+    aligned_h = int(geom.get("aligned_height", int(latent_tensor.shape[-2]) * compression))
+    aligned_w = int(geom.get("aligned_width", int(latent_tensor.shape[-1]) * compression))
+    output_h = aligned_h * handle.pid_scale
+    output_w = aligned_w * handle.pid_scale
+    final_h = int(geom.get("original_height", aligned_h)) * handle.pid_scale
+    final_w = int(geom.get("original_width", aligned_w)) * handle.pid_scale
 
     prompt_value = _resolve_pid_prompt(handle, prompt, pid_prompt=pid_prompt, clip=clip)
     uncond_prompt_value = (
@@ -2691,7 +2763,15 @@ def decode_latent_tiled(
     )
 
     effective_steps = int(pid_inference_steps) if pid_inference_steps is not None else 4
-    progress = _DecodeProgress(total=max(1, effective_steps), node_id=unique_id)
+    _pid_console_section("PiD tiled image restoration")
+    _pid_console(f"backbone: {handle.backbone} | scale: x{handle.pid_scale} | compression: {compression}", indent=1)
+    _pid_console(f"latent: {int(latent_tensor.shape[-1])}x{int(latent_tensor.shape[-2])} | aligned input: {aligned_w}x{aligned_h}px", indent=1)
+    _pid_console(f"working output: {output_w}x{output_h}px | final crop: {final_w}x{final_h}px", indent=1)
+    _pid_console(f"steps: {effective_steps} | cfg: {float(cfg_scale):.2f} | seed: {int(seed)}", indent=1)
+    _pid_console(f"tile: {int(tile_size)}px | overlap: {int(tile_overlap)}px | tile_batch_size: {int(tile_batch_size)}", indent=1)
+    _pid_console(f"seam_refine: {'on' if seam_refine else 'off'} | strength: {float(seam_refine_strength):.2f}", indent=1)
+
+    progress = _DecodeProgress(total=max(1, effective_steps), node_id=unique_id, label="PiD restore")
 
     def _step_preview_callback(step_images: torch.Tensor) -> None:
         try:
@@ -2701,23 +2781,23 @@ def decode_latent_tiled(
         progress.update(advance=1, preview=preview_tuple, emit_bar=True)
 
     effective_sde_noise_strength = float(sde_noise_strength) * float(tiled_sde_noise_boost)
-    print(
-        f"PiD tiled SDE: base={float(sde_noise_strength):.2f}, "
-        f"boost={float(tiled_sde_noise_boost):.2f}, effective={effective_sde_noise_strength:.2f}.",
-        flush=True,
+    _pid_console(
+        f"SDE noise: base={float(sde_noise_strength):.2f} | boost={float(tiled_sde_noise_boost):.2f} | "
+        f"effective={effective_sde_noise_strength:.2f}",
+        indent=1,
     )
     if float(lq_conditioning_boost) > 0.0:
-        print(
-            f"PiD LQ conditioning: degrade_sigma={float(degrade_sigma):.2f}, "
-            f"boost={float(lq_conditioning_boost):.2f}, "
-            f"effective_sigma={float(degrade_sigma) - max(0.0, float(lq_conditioning_boost)):.2f}.",
-            flush=True,
+        _pid_console(
+            f"LQ conditioning: degrade_sigma={float(degrade_sigma):.2f} | "
+            f"boost={float(lq_conditioning_boost):.2f} | "
+            f"effective_sigma={float(degrade_sigma) - max(0.0, float(lq_conditioning_boost)):.2f}",
+            indent=1,
         )
     if float(source_denoise_strength) < 1.0:
-        print(
-            f"PiD source init: denoise={float(source_denoise_strength):.2f}, "
-            f"detail_noise_boost={float(source_detail_noise_boost):.2f}.",
-            flush=True,
+        _pid_console(
+            f"source init: denoise={float(source_denoise_strength):.2f} | "
+            f"detail_noise_boost={float(source_detail_noise_boost):.2f}",
+            indent=1,
         )
 
     samples = _decode_samples(
@@ -2764,12 +2844,9 @@ def decode_latent_tiled(
                 compression,
                 ((max(compression, tile_size - tile_overlap) // 2) // compression) * compression,
             )
-            print(
-                f"PiD seam refine: shifted grid offset={seam_grid_offset}, "
-                f"strength={seam_refine_strength:.2f}.",
-                flush=True,
-            )
-            refine_progress = _DecodeProgress(total=max(1, effective_steps), node_id=unique_id)
+            _pid_console_section("PiD seam refine")
+            _pid_console(f"shifted grid offset: {seam_grid_offset}px | strength: {seam_refine_strength:.2f}", indent=1)
+            refine_progress = _DecodeProgress(total=max(1, effective_steps), node_id=unique_id, label="PiD seam refine")
 
             def _refine_preview_callback(step_images: torch.Tensor) -> None:
                 try:
@@ -2815,6 +2892,12 @@ def decode_latent_tiled(
         final_preview = None
     if final_preview is not None:
         progress.update(advance=0, preview=final_preview, emit_bar=True)
+
+    elapsed = time.perf_counter() - started_at
+    megapixels = (final_h * final_w) / 1_000_000.0
+    _pid_console_section("PiD complete")
+    _pid_console(f"output: {final_w}x{final_h}px ({megapixels:.2f} MP)", indent=1)
+    _pid_console(f"elapsed: {_format_duration(elapsed)}", indent=1)
 
     return final_image
 
