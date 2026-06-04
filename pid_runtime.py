@@ -113,8 +113,8 @@ MIN_TILED_INFERENCE_INPUT_SIZE = {
     "zimage-turbo": 512,
 }
 TILED_REFERENCE_MOMENT_MATCH_STRENGTH = 0.55
-TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_STRENGTH = 0.45
-TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_SIZE = 128
+TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_STRENGTH = 0.70
+TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_SIZE = 512
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
@@ -2058,8 +2058,8 @@ def _anchor_low_frequency_to_reference(
     if (low_h, low_w) == (height, width):
         return torch.lerp(pred_f, ref_f, strength).to(dtype=prediction.dtype)
 
-    pred_low = F.interpolate(pred_f, size=(low_h, low_w), mode="bicubic", align_corners=False)
-    ref_low = F.interpolate(ref_f, size=(low_h, low_w), mode="bicubic", align_corners=False)
+    pred_low = F.interpolate(pred_f, size=(low_h, low_w), mode="bicubic", align_corners=False, antialias=True)
+    ref_low = F.interpolate(ref_f, size=(low_h, low_w), mode="bicubic", align_corners=False, antialias=True)
     correction = F.interpolate(ref_low - pred_low, size=(height, width), mode="bicubic", align_corners=False)
     return (pred_f + correction * strength).to(dtype=prediction.dtype)
 
@@ -2262,6 +2262,11 @@ def _decode_samples(
             indent=2,
         )
         _pid_console(f"context min: {min_size}x{min_size}px input | output commit keeps the requested tile", indent=2)
+        if reference_match_state is not None:
+            _pid_console(
+                "reference anchor: moments + low/mid frequency stabilization",
+                indent=2,
+            )
         _pid_console(f"grid offset: {grid_offset_latent * compression * handle.pid_scale}px | global state: cpu", indent=2)
         weight_cache_cpu = {}
 
