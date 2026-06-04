@@ -627,8 +627,8 @@ def normalize_checkpoint_variant(backbone: str, ckpt_type: str | None) -> str:
         normalized = allowed[0]
         if ckpt_type not in (None, "", "auto", normalized):
             print(
-                f"PiD: checkpoint_variant '{ckpt_type}' nao e valido para backbone '{backbone}'. "
-                f"Usando automaticamente '{normalized}'.",
+                f"PiD: checkpoint_variant '{ckpt_type}' is not valid for backbone '{backbone}'. "
+                f"Automatically using '{normalized}'.",
                 flush=True,
             )
         return normalized
@@ -865,11 +865,11 @@ def _find_native_text_encoder_files(name: str) -> tuple[list[Path], Path]:
     text_encoder_dir = _native_text_encoder_dir(name)
     shard_paths = sorted(text_encoder_dir.rglob("*.safetensors"))
     if not shard_paths:
-        raise FileNotFoundError(f"Nenhum shard safetensors encontrado para o text encoder PiD em {text_encoder_dir}.")
+        raise FileNotFoundError(f"No safetensors shard was found for the PiD text encoder at {text_encoder_dir}.")
 
     tokenizer_candidates = sorted(text_encoder_dir.rglob("tokenizer.model"))
     if not tokenizer_candidates:
-        raise FileNotFoundError(f"tokenizer.model nao encontrado para o text encoder PiD em {text_encoder_dir}.")
+        raise FileNotFoundError(f"tokenizer.model was not found for the PiD text encoder at {text_encoder_dir}.")
     return shard_paths, tokenizer_candidates[0]
 
 
@@ -926,21 +926,22 @@ def _validate_pid_prompt_tensors(
     prompt_source: str,
 ) -> None:
     if caption_embs.ndim != 3:
-        raise ValueError(f"caption_embs invalido para PiD: {tuple(caption_embs.shape)}.")
+        raise ValueError(f"Invalid PiD caption_embs shape: {tuple(caption_embs.shape)}.")
     if int(caption_embs.shape[1]) != PID_TEXT_TOKEN_COUNT or int(caption_embs.shape[2]) != PID_TEXT_EMBED_DIM:
         raise ValueError(
-            f"{prompt_source} gerou embeddings {tuple(caption_embs.shape)}; o PiD espera [B,{PID_TEXT_TOKEN_COUNT},{PID_TEXT_EMBED_DIM}]. "
-            "Use o text encoder Gemma do PiD ou um CLIP carregado com type='pixeldit'."
+            f"{prompt_source} produced embeddings {tuple(caption_embs.shape)}; PiD expects "
+            f"[B,{PID_TEXT_TOKEN_COUNT},{PID_TEXT_EMBED_DIM}]. Use the PiD Gemma text encoder "
+            "or a CLIP loaded with type='pixeldit'."
         )
     if attention_mask is not None and tuple(attention_mask.shape) != tuple(caption_embs.shape[:2]):
         raise ValueError(
-            f"attention_mask invalida para PiD: esperado {tuple(caption_embs.shape[:2])}, recebeu {tuple(attention_mask.shape)}."
+            f"Invalid PiD attention_mask: expected {tuple(caption_embs.shape[:2])}, got {tuple(attention_mask.shape)}."
         )
 
 
 def _encode_prompt_with_external_clip(clip: Any, prompt: str) -> PiDPrompt:
     if not _is_comfy_clip_text_encoder(clip):
-        raise ValueError("O input clip do PiD precisa ser um objeto CLIP do ComfyUI.")
+        raise ValueError("The PiD clip input must be a ComfyUI CLIP object.")
 
     import comfy.model_management
 
@@ -977,7 +978,7 @@ def _ensure_assets(backbone: str, ckpt_type: str) -> None:
             allow_patterns=patterns,
         )
     except Exception as e:
-        print(f"[Warning] PiD: Falha ao baixar assets para '{backbone}' do HF (pode ser offline ou modelo customizado): {e}")
+        print(f"[Warning] PiD: failed to download assets for '{backbone}' from HF (offline or custom model): {e}")
 
 
 def _prepare_handle(backbone: str, ckpt_type: str) -> PiDHandle:
@@ -1100,7 +1101,7 @@ def _clear_prompt_cache(prefix: tuple[str, str] | None = None) -> None:
 def _to_light_model(model: Any, backbone: str) -> _LightPiDModel:
     config = getattr(model, "config", None)
     if config is None:
-        raise RuntimeError("PiD runtime invalido: modelo carregado sem config.")
+        raise RuntimeError("Invalid PiD runtime: loaded model has no config.")
 
     light_config = _LightPiDConfig(
         backbone=backbone,
@@ -1119,7 +1120,7 @@ def _to_light_model(model: Any, backbone: str) -> _LightPiDModel:
 
     net = getattr(model, "net", None)
     if net is None:
-        raise RuntimeError("PiD runtime invalido: modelo carregado sem net.")
+        raise RuntimeError("Invalid PiD runtime: loaded model has no net.")
 
     text_encoder = getattr(model, "text_encoder", None)
     vae_encoder = getattr(model, "vae_encoder", None)
@@ -1158,7 +1159,7 @@ def _load_native_model(backbone: str, checkpoint_path: Path) -> _NativePiDModel:
     patcher = comfy.sd.load_diffusion_model(str(checkpoint_path), model_options={})
     base_model = patcher.model
     if base_model is None or getattr(base_model, "diffusion_model", None) is None:
-        raise RuntimeError(f"Falha ao carregar runtime nativo PiD para {backbone}.")
+        raise RuntimeError(f"Failed to load native PiD runtime for {backbone}.")
     return _NativePiDModel(
         patcher=patcher,
         base_model=base_model,
@@ -1193,7 +1194,7 @@ def _load_runtime(backbone: str, ckpt_type: str) -> tuple[PiDHandle, Any]:
     global _ACTIVE_RUNTIME
 
     if not torch.cuda.is_available():
-        raise RuntimeError("PiD precisa de CUDA para carregar e inferir no ComfyUI.")
+        raise RuntimeError("PiD requires CUDA to load and run inference in ComfyUI.")
 
     cache_key = (backbone, ckpt_type)
     handle = _prepare_handle(backbone, ckpt_type)
@@ -1268,7 +1269,7 @@ def _normalize_pid_prompt(pid_prompt: Any) -> PiDPrompt:
             attention_mask=pid_prompt.get("attention_mask"),
             prompt=str(pid_prompt.get("prompt", "")),
         )
-    raise TypeError("O prompt do PiD precisa ser um PiDPrompt ou dict com 'caption_embs'.")
+    raise TypeError("The PiD prompt must be a PiDPrompt or a dict with 'caption_embs'.")
 
 
 def _resolve_pid_prompt(handle: PiDHandle, prompt: str, pid_prompt: Any = None, clip: Any = None) -> PiDPrompt:
@@ -1302,7 +1303,7 @@ def _encode_prompt_once(handle: PiDHandle, prompt: str, clip: Any = None) -> PiD
         model._ensure_text_encoder_loaded()
     text_encoder = getattr(model, "text_encoder", None)
     if text_encoder is None:
-        raise RuntimeError("O modelo PiD carregado nao possui text_encoder.")
+        raise RuntimeError("The loaded PiD model does not have a text_encoder.")
     if not _is_comfy_clip_text_encoder(text_encoder):
         _set_module_device(text_encoder, handle.device)
     with torch.inference_mode():
@@ -1348,15 +1349,15 @@ def encode_prompt(handle: PiDHandle, prompt: str, clip: Any = None) -> dict[str,
 def _extract_latent_tensor(latent: Any) -> torch.Tensor:
     if isinstance(latent, dict):
         if "samples" not in latent:
-            raise KeyError("O LATENT recebido nao contem a chave 'samples'.")
+            raise KeyError("The received LATENT does not contain the 'samples' key.")
         latent_tensor = latent["samples"]
     elif torch.is_tensor(latent):
         latent_tensor = latent
     else:
-        raise TypeError("O input LATENT precisa ser um dict do ComfyUI ou um torch.Tensor.")
+        raise TypeError("The LATENT input must be a ComfyUI dict or a torch.Tensor.")
 
     if latent_tensor.ndim != 4:
-        raise ValueError(f"Esperado latent 4D [B,C,H,W], recebido {tuple(latent_tensor.shape)}.")
+        raise ValueError(f"Expected 4D latent [B,C,H,W], got {tuple(latent_tensor.shape)}.")
     return latent_tensor
 
 
@@ -1371,11 +1372,11 @@ def _extract_latent_geometry(latent: Any) -> dict[str, int] | None:
 
 def _extract_image_tensor(image: Any) -> torch.Tensor:
     if not torch.is_tensor(image):
-        raise TypeError("O input IMAGE precisa ser um torch.Tensor do ComfyUI.")
+        raise TypeError("The IMAGE input must be a ComfyUI torch.Tensor.")
     if image.ndim != 4:
-        raise ValueError(f"Esperado IMAGE 4D [B,H,W,C], recebido {tuple(image.shape)}.")
+        raise ValueError(f"Expected 4D IMAGE [B,H,W,C], got {tuple(image.shape)}.")
     if image.shape[-1] != 3:
-        raise ValueError(f"Esperado IMAGE com 3 canais em [B,H,W,C], recebido {tuple(image.shape)}.")
+        raise ValueError(f"Expected IMAGE with 3 channels in [B,H,W,C], got {tuple(image.shape)}.")
     return image
 
 
@@ -1644,11 +1645,11 @@ def encode_image_to_latent(
     _offload_aux_modules(model)
 
     if latent.ndim != 4:
-        raise ValueError(f"Encoder do PiD retornou latent invalido: {tuple(latent.shape)}.")
+        raise ValueError(f"PiD encoder returned an invalid latent: {tuple(latent.shape)}.")
     if latent.shape[1] != handle.latent_channels:
         raise ValueError(
-            f"Encoder do PiD para '{handle.backbone}' retornou {latent.shape[1]} canais, "
-            f"mas o modelo espera {handle.latent_channels}."
+            f"PiD encoder for '{handle.backbone}' returned {latent.shape[1]} channels, "
+            f"but the model expects {handle.latent_channels}."
         )
 
     latent_dict: dict[str, Any] = {
@@ -1788,9 +1789,9 @@ def _resize_spatial_tensor(tensor: torch.Tensor, size: tuple[int, int], interpol
 
 def resize_latent(latent: Any, latent_scale: float, interpolation: str) -> Any:
     if interpolation not in SUPPORTED_LATENT_INTERPOLATIONS:
-        raise ValueError(f"Interpolacao de latent nao suportada: {interpolation!r}")
+        raise ValueError(f"Unsupported latent interpolation: {interpolation!r}")
     if latent_scale <= 0:
-        raise ValueError("latent_scale precisa ser maior que zero.")
+        raise ValueError("latent_scale must be greater than zero.")
 
     latent_tensor = _extract_latent_tensor(latent)
     if abs(float(latent_scale) - 1.0) < 1e-8:
@@ -1860,7 +1861,7 @@ def _repeat_pid_prompt(pid_prompt: PiDPrompt, repeat_blocks: int, base_batch: in
             attention_mask = attention_mask.repeat((repeat_blocks, 1)).contiguous()
     elif prompt_batch != target_batch:
         raise ValueError(
-            f"caption_embs precisa ter batch 1, {base_batch} ou {target_batch}, mas recebeu {prompt_batch}."
+            f"caption_embs must have batch 1, {base_batch}, or {target_batch}, but got {prompt_batch}."
         )
 
     return PiDPrompt(caption_embs=caption_embs, attention_mask=attention_mask, prompt=pid_prompt.prompt)
@@ -2000,7 +2001,7 @@ def _output_pixels_to_latent_units(value: int, compression: int, pid_scale: int,
     output_unit = max(1, int(compression) * int(pid_scale))
     if value % output_unit != 0:
         raise ValueError(
-            f"{name} precisa ser multiplo de {output_unit} px "
+            f"{name} must be a multiple of {output_unit} px "
             f"(compression {compression} x scale {pid_scale})."
         )
     return max(1, int(value) // output_unit)
@@ -2060,8 +2061,8 @@ def _decode_samples(
 ) -> torch.Tensor:
     if latent_tensor.shape[1] != handle.latent_channels:
         raise ValueError(
-            f"Backbone '{handle.backbone}' espera {handle.latent_channels} canais no latent, "
-            f"mas recebeu {latent_tensor.shape[1]}."
+            f"Backbone '{handle.backbone}' expects {handle.latent_channels} latent channels, "
+            f"but got {latent_tensor.shape[1]}."
         )
 
     model = _get_model(handle)
@@ -2085,7 +2086,7 @@ def _decode_samples(
         caption_embs = caption_embs.expand(batch_size, -1, -1)
     elif caption_embs.shape[0] != batch_size:
         raise ValueError(
-            f"caption_embs precisa ter batch 1 ou {batch_size}, mas recebeu {caption_embs.shape[0]}."
+            f"caption_embs must have batch 1 or {batch_size}, but got {caption_embs.shape[0]}."
         )
 
     caption_embs = caption_embs.to(device=device, dtype=precision)
@@ -2096,12 +2097,12 @@ def _decode_samples(
     if use_cfg:
         uncond_caption_embs = uncond_pid_prompt.caption_embs
         uncond_attention_mask = uncond_pid_prompt.attention_mask
-        _validate_pid_prompt_tensors(uncond_caption_embs, uncond_attention_mask, prompt_source="O prompt negativo do CFG")
+        _validate_pid_prompt_tensors(uncond_caption_embs, uncond_attention_mask, prompt_source="The CFG negative prompt")
         if uncond_caption_embs.shape[0] == 1 and batch_size > 1:
             uncond_caption_embs = uncond_caption_embs.expand(batch_size, -1, -1)
         elif uncond_caption_embs.shape[0] != batch_size:
             raise ValueError(
-                f"prompt negativo do CFG precisa ter batch 1 ou {batch_size}, mas recebeu {uncond_caption_embs.shape[0]}."
+                f"The CFG negative prompt must have batch 1 or {batch_size}, but got {uncond_caption_embs.shape[0]}."
             )
         uncond_caption_embs = uncond_caption_embs.to(device=device, dtype=precision)
         if uncond_attention_mask is not None:
@@ -2119,7 +2120,7 @@ def _decode_samples(
     else:
         expected_shape = (batch_size, 3, output_h, output_w)
         if tuple(noise.shape) != expected_shape:
-            raise ValueError(f"Ruido inicial invalido para PiD: esperado {expected_shape}, recebido {tuple(noise.shape)}.")
+            raise ValueError(f"Invalid initial PiD noise: expected {expected_shape}, got {tuple(noise.shape)}.")
         noise = noise.to(device=state_device, dtype=precision)
     source_state = None
     reference_match_state = None
@@ -2131,7 +2132,7 @@ def _decode_samples(
             prepared = prepared.expand(batch_size, -1, -1, -1)
         elif prepared.shape[0] != batch_size:
             raise ValueError(
-                f"source_image precisa ter batch 1 ou {batch_size}, mas recebeu {prepared.shape[0]}."
+                f"source_image must have batch 1 or {batch_size}, but got {prepared.shape[0]}."
             )
         if source_geometry is not None:
             original_size = (
@@ -2578,11 +2579,11 @@ def _samples_to_image_tensor(samples: torch.Tensor) -> torch.Tensor:
 
 def _compute_tile_starts(total: int, tile: int, overlap: int) -> list[int]:
     if tile <= 0:
-        raise ValueError("tile_size precisa ser maior que zero.")
+        raise ValueError("tile_size must be greater than zero.")
     if overlap < 0:
-        raise ValueError("tile_overlap nao pode ser negativo.")
+        raise ValueError("tile_overlap cannot be negative.")
     if overlap >= tile:
-        raise ValueError("tile_overlap precisa ser menor que tile_size.")
+        raise ValueError("tile_overlap must be smaller than tile_size.")
     if total <= tile:
         return [0]
 
@@ -2869,13 +2870,13 @@ def decode_latent_tiled(
     compression = handle.latent_compression
     output_unit = compression * handle.pid_scale
     if tile_size % output_unit != 0:
-        raise ValueError(f"tile_size precisa ser multiplo de {output_unit} px para o backbone '{handle.backbone}'.")
+        raise ValueError(f"tile_size must be a multiple of {output_unit} px for backbone '{handle.backbone}'.")
     if tile_overlap % output_unit != 0:
-        raise ValueError(f"tile_overlap precisa ser multiplo de {output_unit} px para o backbone '{handle.backbone}'.")
+        raise ValueError(f"tile_overlap must be a multiple of {output_unit} px for backbone '{handle.backbone}'.")
     if tile_overlap >= tile_size:
-        raise ValueError("tile_overlap precisa ser menor que tile_size.")
+        raise ValueError("tile_overlap must be smaller than tile_size.")
     if tile_batch_size <= 0:
-        raise ValueError("tile_batch_size precisa ser maior que zero.")
+        raise ValueError("tile_batch_size must be greater than zero.")
     requested_tile_size = int(tile_size)
     min_output_tile = int(MIN_TILED_DECODE_SIZE.get(handle.backbone, tile_size))
     if tile_size < min_output_tile:
@@ -3192,12 +3193,12 @@ def match_colors(target: torch.Tensor, reference: torch.Tensor, method: str = "r
     if ref.shape[0] == 1 and B > 1:
         ref = ref.expand(B, -1, -1, -1)
     elif ref.shape[0] != B:
-        raise ValueError(f"reference precisa ter batch 1 ou {B}, mas recebeu {ref.shape[0]}.")
+        raise ValueError(f"reference must have batch 1 or {B}, but got {ref.shape[0]}.")
 
     if method in ("wavelet", "low_frequency"):
         return _low_frequency_color_match(target, ref, strength)
     if method != "reinhard_rgb":
-        raise ValueError(f"Metodo de color_match desconhecido: {method}")
+        raise ValueError(f"Unknown color_match method: {method}")
 
     out = target.clone()
     for b in range(B):

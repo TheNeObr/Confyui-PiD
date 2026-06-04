@@ -132,7 +132,7 @@ class DummyNativeBaseModel:
         return torch.bfloat16
 
     def apply_model(self, *args, **kwargs):
-        raise AssertionError("apply_model nao deve ser usado no caminho nativo do PiD distill")
+        raise AssertionError("apply_model must not be used in the native PiD distill path")
 
 
 class _FakeLinearOut:
