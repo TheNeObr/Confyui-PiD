@@ -2500,6 +2500,9 @@ def _decode_samples(
                                 emit_bar=preview_enabled,
                             )
             x0_student = x
+        if source_state is not None and source_denoise_strength < 1.0:
+            blend = max(0.0, min(1.0, float(source_denoise_strength)))
+            x0_student = torch.lerp(source_state.to(device=x0_student.device, dtype=x0_student.dtype), x0_student, blend)
     return x0_student.clamp(-1, 1).unsqueeze(2)
 
 

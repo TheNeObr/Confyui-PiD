@@ -1718,6 +1718,36 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(model.last_x, torch.full_like(initial_noise, 0.375), atol=1e-5))
 
+    def test_decode_samples_source_denoise_strength_anchors_final_output(self):
+        class SourceAnchorModel(DummyModel):
+            def predict_x0(self, x, sigma, caption_embs, attention_mask, lq_latent, degrade_sigma):
+                self.call_count += 1
+                return torch.ones_like(x)
+
+        model = SourceAnchorModel()
+        handle = self._register_runtime(model)
+        prompt = pid_runtime.PiDPrompt(
+            caption_embs=torch.zeros((1, pid_runtime.PID_TEXT_TOKEN_COUNT, pid_runtime.PID_TEXT_EMBED_DIM), dtype=torch.float32),
+            attention_mask=torch.ones((1, pid_runtime.PID_TEXT_TOKEN_COUNT), dtype=torch.int64),
+            prompt="",
+        )
+
+        samples = pid_runtime._decode_samples(
+            handle=handle,
+            latent_tensor=torch.zeros((1, 16, 1, 1), dtype=torch.float32),
+            pid_prompt=prompt,
+            cfg_scale=1.0,
+            pid_inference_steps=2,
+            seed=0,
+            degrade_sigma=0.0,
+            source_image=torch.full((1, 8, 8, 3), 0.5, dtype=torch.float32),
+            source_denoise_strength=0.2,
+            sde_noise_strength=0.0,
+            noise=torch.zeros((1, 3, 32, 32), dtype=torch.float32),
+        )
+
+        self.assertTrue(torch.allclose(samples.squeeze(2), torch.full((1, 3, 32, 32), 0.2), atol=1e-5))
+
     def test_decode_samples_tiled_sde_casts_float32_prediction_to_bfloat16_state(self):
         model = DummyModel()
         model.precision = torch.bfloat16
