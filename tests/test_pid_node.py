@@ -316,8 +316,22 @@ class PiDRuntimeTests(unittest.TestCase):
             image=torch.ones((1, 1000, 1537, 3), dtype=torch.float32),
         )
 
-        self.assertEqual(tuple(model.last_image.shape), (1, 3, 1024, 1600))
         self.assertEqual(tuple(latent["samples"].shape), (1, 128, 64, 100))
+
+    def test_encode_image_to_latent_auto_tiles_large_flux2_inputs(self):
+        model = DummyModel(encode_latent_channels=128, encode_compression=16)
+        model.encode_lq_latent = mock.Mock(side_effect=model.encode_lq_latent)
+        handle = self._register_runtime(model, backbone="flux2", latent_channels=128, latent_compression=16)
+
+        latent = pid_runtime.encode_image_to_latent(
+            handle=handle,
+            image=torch.ones((1, 1000, 1537, 3), dtype=torch.float32),
+        )
+
+        self.assertEqual(tuple(latent["samples"].shape), (1, 128, 64, 100))
+        self.assertGreater(model.encode_lq_latent.call_count, 1)
+        self.assertLessEqual(int(model.last_image.shape[-1]), 512)
+        self.assertLessEqual(int(model.last_image.shape[-2]), 512)
 
     def test_autocorrect_encode_image_tensor_preserves_pixels_without_resizing(self):
         handle = self._register_runtime(DummyModel(), backbone="flux", latent_channels=16, latent_compression=8)
@@ -1812,13 +1826,25 @@ class PiDNodeTests(unittest.TestCase):
         patched.assert_called_once_with("model", mock.ANY, encode_tile_size=512)
         self.assertEqual(result, (sentinel,))
 
-    def test_encode_image_node_disables_tiled_encode_by_default(self):
+    def test_encode_image_node_uses_auto_tiled_encode_by_default(self):
+        inputs = nodes.PiDEncodeImage.INPUT_TYPES()
+        self.assertEqual(inputs["required"]["encode_tile_size"][1]["default"], "auto")
+
+        node = nodes.PiDEncodeImage()
+        sentinel = {"samples": torch.zeros((1, 16, 8, 8))}
+        with mock.patch.object(nodes, "encode_image_to_latent", return_value=sentinel) as patched:
+            result = node.encode("model", torch.zeros((1, 64, 64, 3)), "auto")
+
+        patched.assert_called_once_with("model", mock.ANY, encode_tile_size=None)
+        self.assertEqual(result, (sentinel,))
+
+    def test_encode_image_node_can_force_full_encode(self):
         node = nodes.PiDEncodeImage()
         sentinel = {"samples": torch.zeros((1, 16, 8, 8))}
         with mock.patch.object(nodes, "encode_image_to_latent", return_value=sentinel) as patched:
             result = node.encode("model", torch.zeros((1, 64, 64, 3)), "disabled")
 
-        patched.assert_called_once_with("model", mock.ANY, encode_tile_size=None)
+        patched.assert_called_once_with("model", mock.ANY, encode_tile_size=0)
         self.assertEqual(result, (sentinel,))
 
     def test_encode_prompt_node_delegates_to_runtime(self):

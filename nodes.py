@@ -144,12 +144,17 @@ class PiDEncodeImage:
             "required": {
                 "pid_model": ("PID_MODEL",),
                 "image": ("IMAGE",),
-                "encode_tile_size": (["disabled", "512", "1024"], {"default": "disabled"}),
+                "encode_tile_size": (["auto", "disabled", "512", "1024"], {"default": "auto"}),
             }
         }
 
     def encode(self, pid_model, image, encode_tile_size):
-        tile_size = None if encode_tile_size == "disabled" else int(encode_tile_size)
+        if encode_tile_size == "auto":
+            tile_size = None
+        elif encode_tile_size == "disabled":
+            tile_size = 0
+        else:
+            tile_size = int(encode_tile_size)
         return (encode_image_to_latent(pid_model, image, encode_tile_size=tile_size),)
 
 

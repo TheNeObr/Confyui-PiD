@@ -70,6 +70,22 @@ PID_TEXT_EMBED_DIM = 2304
 PID_TEXT_TOKEN_COUNT = 300
 MAX_PROMPT_CACHE_ITEMS = 8
 AUTOENCODE_TILE_OVERLAP = {backbone: 128 for backbone in SUPPORTED_BACKBONES}
+AUTOENCODE_MAX_FULL_SIZE = {backbone: 1536 for backbone in SUPPORTED_BACKBONES}
+AUTOENCODE_MAX_FULL_SIZE.update(
+    {
+        "flux2": 1024,
+        "flux2-klein-4b": 1024,
+        "flux2-klein-9b": 1024,
+    }
+)
+AUTOENCODE_DEFAULT_TILE_SIZE = {backbone: 1024 for backbone in SUPPORTED_BACKBONES}
+AUTOENCODE_DEFAULT_TILE_SIZE.update(
+    {
+        "flux2": 512,
+        "flux2-klein-4b": 512,
+        "flux2-klein-9b": 512,
+    }
+)
 # Tiles muito pequenos tendem a colapsar a cor no PiD; decodificamos com contexto maior
 # e recortamos o centro para manter a saida pedida sem o desvio verde.
 MIN_TILED_DECODE_SIZE = {
@@ -1565,14 +1581,26 @@ def encode_image_to_latent(
     _set_module_device(vae_encoder, handle.device)
     height = int(chw_image.shape[-2])
     width = int(chw_image.shape[-1])
-    if encode_tile_size is None:
+    requested_encode_tile_size = encode_tile_size
+    if requested_encode_tile_size is None:
+        max_full_size = int(AUTOENCODE_MAX_FULL_SIZE.get(handle.backbone, 1536))
+        if max(height, width) > max_full_size:
+            requested_encode_tile_size = int(AUTOENCODE_DEFAULT_TILE_SIZE.get(handle.backbone, max_full_size))
+            _pid_console_section("PiD tiled VAE encode")
+            _pid_console(
+                f"backbone: {handle.backbone} | image: {width}x{height}px | full encode limit: {max_full_size}px",
+                indent=1,
+            )
+            _pid_console(f"auto tile: {requested_encode_tile_size}px", indent=1)
+
+    if requested_encode_tile_size is None or requested_encode_tile_size <= 0:
         vae_input = chw_image.to(device=handle.device, dtype=vae_dtype, non_blocking=True)
         vae_input.mul_(2.0).add_(-1.0).clamp_(-1.0, 1.0)
         with torch.inference_mode():
             latent = model.encode_lq_latent(vae_input)
         del vae_input
     else:
-        tile_size = max(handle.latent_compression, int(encode_tile_size))
+        tile_size = max(handle.latent_compression, int(requested_encode_tile_size))
         tile_size = max(handle.latent_compression, (tile_size // handle.latent_compression) * handle.latent_compression)
         overlap = int(AUTOENCODE_TILE_OVERLAP.get(handle.backbone, 128))
         overlap = max(0, min(tile_size - handle.latent_compression, (overlap // handle.latent_compression) * handle.latent_compression))
@@ -1643,15 +1671,25 @@ def _encode_image_to_latent_tiled(
     overlap_latent = tile_overlap // compression
     starts_y = _compute_tile_starts(height, tile_size, tile_overlap)
     starts_x = _compute_tile_starts(width, tile_size, tile_overlap)
+    total_tiles = len(starts_y) * len(starts_x)
+    _pid_console("VAE encode tiled plan", indent=1)
+    _pid_console(f"tiles: {total_tiles} | tile: {tile_size}x{tile_size}px | overlap: {tile_overlap}px", indent=2)
+    _pid_console(f"latent output: {latent_w}x{latent_h} | compression: {compression}", indent=2)
 
     output = torch.zeros((batch_size, handle.latent_channels, latent_h, latent_w), dtype=torch.float32, device="cpu")
     weight_sum = torch.zeros((1, 1, latent_h, latent_w), dtype=torch.float32, device="cpu")
     weight_cache: dict[tuple[int, int, int, bool, bool, bool, bool], torch.Tensor] = {}
 
+    tile_index = 0
     for start_y in starts_y:
         for start_x in starts_x:
+            tile_index += 1
             end_y = min(start_y + tile_size, height)
             end_x = min(start_x + tile_size, width)
+            _pid_console(
+                f"encode tile {tile_index}/{total_tiles}: x={start_x}:{end_x} y={start_y}:{end_y}",
+                indent=2,
+            )
             pixel_tile = chw_image[:, :, start_y:end_y, start_x:end_x]
             vae_input = pixel_tile.to(device=handle.device, dtype=vae_dtype, non_blocking=True)
             vae_input.mul_(2.0).add_(-1.0).clamp_(-1.0, 1.0)
