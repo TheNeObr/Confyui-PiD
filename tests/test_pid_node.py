@@ -907,6 +907,30 @@ class PiDRuntimeTests(unittest.TestCase):
         starts = pid_runtime._compute_shifted_tile_starts(total=10, tile=4, overlap=1, offset=2)
         self.assertEqual(starts, [0, 2, 5, 6])
 
+    def test_tile_weight_mask_var_produces_perfectly_complementary_ramps(self):
+        mask_tile1 = pid_runtime._tile_weight_mask_var(
+            height=1024,
+            width=1024,
+            overlap_top=0,
+            overlap_bottom=0,
+            overlap_left=0,
+            overlap_right=192,
+            device=torch.device("cpu"),
+        )
+        mask_tile2 = pid_runtime._tile_weight_mask_var(
+            height=1024,
+            width=1024,
+            overlap_top=0,
+            overlap_bottom=0,
+            overlap_left=192,
+            overlap_right=0,
+            device=torch.device("cpu"),
+        )
+        weight1_overlap = mask_tile1[0, :, 832:, 0]
+        weight2_overlap = mask_tile2[0, :, :192, 0]
+        sum_overlap = weight1_overlap + weight2_overlap
+        self.assertTrue(torch.allclose(sum_overlap, torch.ones_like(sum_overlap), atol=1e-5))
+
     def test_seam_refine_mask_targets_overlaps_and_intersections(self):
         mask = pid_runtime._make_seam_refine_mask(
             latent_h=4,
@@ -1075,8 +1099,32 @@ class PiDRuntimeTests(unittest.TestCase):
             tile_batch_size=1,
         )
 
-        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (16, 16))
+        self.assertEqual(tuple(model.last_lq_latent.shape[-2:]), (32, 32))
         self.assertEqual(model.call_count, 16)
+
+    def test_flux2_tiled_sampler_velocity_model_steps_1(self):
+        predict_x0_orig = DummyModel.predict_x0
+        del DummyModel.predict_x0
+        try:
+            model = DummyModel()
+            handle = self._register_runtime(model, backbone="flux2", latent_channels=128, latent_compression=16)
+
+            pid_runtime.decode_latent_tiled(
+                handle=handle,
+                latent={"samples": torch.zeros((1, 128, 48, 48), dtype=torch.float32)},
+                prompt="cat",
+                negative_prompt="",
+                cfg_scale=1.0,
+                pid_inference_steps=1,
+                seed=3,
+                degrade_sigma=0.0,
+                tile_size=512,
+                tile_overlap=64,
+                tile_batch_size=1,
+            )
+            self.assertEqual(model.call_count, 16)
+        finally:
+            DummyModel.predict_x0 = predict_x0_orig
 
     def test_decode_latent_tiled_validates_tile_alignment(self):
         handle = self._register_runtime(DummyModel(), backbone="flux2", latent_channels=128, latent_compression=16)

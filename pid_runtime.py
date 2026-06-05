@@ -103,16 +103,16 @@ MIN_TILED_DECODE_SIZE = {
 MIN_TILED_INFERENCE_INPUT_SIZE = {
     "flux": 512,
     "sd3": 512,
-    "flux2": 256,
-    "flux2-klein-4b": 256,
-    "flux2-klein-9b": 256,
+    "flux2": 512,
+    "flux2-klein-4b": 512,
+    "flux2-klein-9b": 512,
     "sdxl": 512,
     "qwenimage": 512,
     "qwenimage-2512": 512,
     "zimage": 512,
     "zimage-turbo": 512,
 }
-TILED_REFERENCE_MEAN_MATCH_STRENGTH = 0.10
+TILED_REFERENCE_MEAN_MATCH_STRENGTH = 0.35
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
@@ -2065,6 +2065,7 @@ def _decode_samples(
     model = _get_model(handle)
     if hasattr(model, "ensure_model_loaded"):
         model.ensure_model_loaded()
+    timescale = float(getattr(getattr(model, "fm_trainer", None), "timescale", 1000.0))
     device = handle.device
     baseline_h = int(latent_tensor.shape[-2]) * handle.latent_compression
     baseline_w = int(latent_tensor.shape[-1]) * handle.latent_compression
@@ -2424,27 +2425,46 @@ def _decode_samples(
                             ].to(device=tile_x0_cropped.device, dtype=tile_x0_cropped.dtype)
                             tile_x0_cropped = _match_tile_mean_to_reference(tile_x0_cropped, reference_tile)
 
+                        idx_y = starts_y.index(job.target_start_y)
+                        idx_x = starts_x.index(job.target_start_x)
+
+                        overlap_top = 0
+                        if idx_y > 0:
+                            overlap_top = (starts_y[idx_y - 1] + tile_latent - job.target_start_y) * compression * handle.pid_scale
+                            overlap_top = max(0, overlap_top)
+
+                        overlap_bottom = 0
+                        if idx_y < len(starts_y) - 1:
+                            overlap_bottom = (job.target_start_y + tile_latent - starts_y[idx_y + 1]) * compression * handle.pid_scale
+                            overlap_bottom = max(0, overlap_bottom)
+
+                        overlap_left = 0
+                        if idx_x > 0:
+                            overlap_left = (starts_x[idx_x - 1] + tile_latent - job.target_start_x) * compression * handle.pid_scale
+                            overlap_left = max(0, overlap_left)
+
+                        overlap_right = 0
+                        if idx_x < len(starts_x) - 1:
+                            overlap_right = (job.target_start_x + tile_latent - starts_x[idx_x + 1]) * compression * handle.pid_scale
+                            overlap_right = max(0, overlap_right)
+
                         weight_key = (
                             tile_h,
                             tile_w,
-                            actual_overlap_y,
-                            actual_overlap_x,
-                            job.target_start_y == 0,
-                            job.target_end_y == int(latent_tensor.shape[-2]),
-                            job.target_start_x == 0,
-                            job.target_end_x == int(latent_tensor.shape[-1]),
+                            overlap_top,
+                            overlap_bottom,
+                            overlap_left,
+                            overlap_right,
                         )
                         weight = weight_cache_cpu.get(weight_key)
                         if weight is None:
-                            weight = _tile_weight_mask(
+                            weight = _tile_weight_mask_var(
                                 height=tile_h,
                                 width=tile_w,
-                                overlap_y=actual_overlap_y,
-                                overlap_x=actual_overlap_x,
-                                top_edge=weight_key[4],
-                                bottom_edge=weight_key[5],
-                                left_edge=weight_key[6],
-                                right_edge=weight_key[7],
+                                overlap_top=overlap_top,
+                                overlap_bottom=overlap_bottom,
+                                overlap_left=overlap_left,
+                                overlap_right=overlap_right,
                                 device=torch.device("cpu"),
                             )
                             weight_cache_cpu[weight_key] = weight
@@ -2503,7 +2523,7 @@ def _decode_samples(
                 x = (1.0 - initial_t) * source_state + initial_t * noise
             else:
                 x = noise
-            timescale = model.fm_trainer.timescale
+            # timescale is already bound in the enclosing scope
             with autocast_ctx:
                 for step_idx, (t_cur, t_next) in enumerate(zip(t_list[:-1], t_list[1:])):
                     t_cur_batch = t_cur.expand(batch_size)
@@ -2679,6 +2699,41 @@ def _tile_weight_mask(
             weight_x[:overlap_x] = torch.minimum(weight_x[:overlap_x], ramp_x)
         if not right_edge:
             weight_x[-overlap_x:] = torch.minimum(weight_x[-overlap_x:], ramp_x.flip(0))
+
+    return (weight_y[:, None] * weight_x[None, :]).unsqueeze(0).unsqueeze(-1)
+
+
+def _tile_weight_mask_var(
+    height: int,
+    width: int,
+    overlap_top: int,
+    overlap_bottom: int,
+    overlap_left: int,
+    overlap_right: int,
+    device: torch.device,
+) -> torch.Tensor:
+    weight_y = torch.ones((height,), dtype=torch.float32, device=device)
+    weight_x = torch.ones((width,), dtype=torch.float32, device=device)
+
+    if overlap_top > 0:
+        ramp_pos_y = torch.linspace(0.0, 1.0, overlap_top, dtype=torch.float32, device=device)
+        ramp_y = 0.5 - 0.5 * torch.cos(ramp_pos_y * torch.pi)
+        weight_y[:overlap_top] = torch.minimum(weight_y[:overlap_top], ramp_y)
+
+    if overlap_bottom > 0:
+        ramp_pos_y = torch.linspace(0.0, 1.0, overlap_bottom, dtype=torch.float32, device=device)
+        ramp_y = 0.5 - 0.5 * torch.cos(ramp_pos_y * torch.pi)
+        weight_y[-overlap_bottom:] = torch.minimum(weight_y[-overlap_bottom:], ramp_y.flip(0))
+
+    if overlap_left > 0:
+        ramp_pos_x = torch.linspace(0.0, 1.0, overlap_left, dtype=torch.float32, device=device)
+        ramp_x = 0.5 - 0.5 * torch.cos(ramp_pos_x * torch.pi)
+        weight_x[:overlap_left] = torch.minimum(weight_x[:overlap_left], ramp_x)
+
+    if overlap_right > 0:
+        ramp_pos_x = torch.linspace(0.0, 1.0, overlap_right, dtype=torch.float32, device=device)
+        ramp_x = 0.5 - 0.5 * torch.cos(ramp_pos_x * torch.pi)
+        weight_x[-overlap_right:] = torch.minimum(weight_x[-overlap_right:], ramp_x.flip(0))
 
     return (weight_y[:, None] * weight_x[None, :]).unsqueeze(0).unsqueeze(-1)
 

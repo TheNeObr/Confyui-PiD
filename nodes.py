@@ -20,7 +20,7 @@ COLOR_MATCH_OPTIONS = ["disabled", "reinhard_rgb", "wavelet"]
 def _format_image_resolution(image) -> str:
     height = int(image.shape[1])
     width = int(image.shape[2])
-    return f"{height} x {width}"
+    return f"{width} x {height}"
 
 
 def _with_resolution_ui(image):
@@ -204,10 +204,10 @@ class PiDKSampler:
                 "keep_model_loaded_on_gpu": ("BOOLEAN", {"default": True}),
                 "use_tiled": ("BOOLEAN", {"default": False}),
                 "tile_size": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64}),
-                "tile_overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8}),
+                "tile_overlap": ("INT", {"default": 128, "min": 0, "max": 512, "step": 8}),
                 "tile_batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
-                "seam_refine": ("BOOLEAN", {"default": False}),
-                "seam_refine_strength": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "seam_refine": ("BOOLEAN", {"default": True}),
+                "seam_refine_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "sde_noise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "tiled_sde_noise_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "color_match": (COLOR_MATCH_OPTIONS, {"default": "disabled"}),
@@ -296,10 +296,10 @@ class PiDDecodeLatentTiled:
                 "pid_model": ("PID_MODEL",),
                 "latent": ("LATENT",),
                 "tile_size": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64}),
-                "tile_overlap": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8}),
+                "tile_overlap": ("INT", {"default": 128, "min": 0, "max": 512, "step": 8}),
                 "tile_batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
-                "seam_refine": ("BOOLEAN", {"default": False}),
-                "seam_refine_strength": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "seam_refine": ("BOOLEAN", {"default": True}),
+                "seam_refine_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "cfg_scale": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0, "step": 0.1}),
