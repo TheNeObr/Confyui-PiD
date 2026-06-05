@@ -62,16 +62,10 @@ Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, with
   - In tiled mode, shows an incremental low-resolution preview during tile restoration and replaces it with the final blended composition when done.
   - Output: `IMAGE`.
 
-## Schedulers and Noise Control
+## Sampler and Noise Control
 
 ### SDE Sampler
 The node uses a stochastic sampler (SDE) by default. Since the distilled DMD2 checkpoints are trained strictly under SDE assumptions, the deterministic ODE sampler has been removed to avoid generating noisy, destroyed images.
-
-### Scheduler Options
-- **`original`**: The default non-linear timestep list from the loaded student model (traditionally optimized for 4 steps). When running with custom step counts, the node uses linear interpolation over the original schedule rather than rounding indices, preventing duplicate or wasted timesteps.
-- **`uniform`**: A linear schedule where timesteps are spaced evenly from the maximum student timestep down to `0.0`.
-- **`cosine`**: A schedule based on a cosine curve. It progresses faster in early timesteps and slows down at the end, giving the model more steps to refine details near the target output.
-- **`quadratic`**: A quadratic decay curve. Timesteps drop quickly at the beginning and slowly decrease towards the end of the sampling path.
 
 ### SDE Noise Strength (`sde_noise_strength`)
 - A float slider from `0.0` to `1.0` that interpolates between the conservative deterministic path and full SDE sampling. Lower values now preserve more of the source trajectory instead of replacing it with a weak random color field.
