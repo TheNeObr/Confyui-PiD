@@ -112,7 +112,7 @@ MIN_TILED_INFERENCE_INPUT_SIZE = {
     "zimage": 512,
     "zimage-turbo": 512,
 }
-TILED_REFERENCE_MOMENT_MATCH_STRENGTH = 0.55
+TILED_REFERENCE_MEAN_MATCH_STRENGTH = 0.25
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
@@ -2007,10 +2007,10 @@ def _output_pixels_to_latent_units(value: int, compression: int, pid_scale: int,
     return max(1, int(value) // output_unit)
 
 
-def _match_tile_moments_to_reference(
+def _match_tile_mean_to_reference(
     tile: torch.Tensor,
     reference: torch.Tensor,
-    strength: float = TILED_REFERENCE_MOMENT_MATCH_STRENGTH,
+    strength: float = TILED_REFERENCE_MEAN_MATCH_STRENGTH,
 ) -> torch.Tensor:
     if tile.shape != reference.shape or tile.ndim != 4:
         return tile
@@ -2023,10 +2023,7 @@ def _match_tile_moments_to_reference(
     reduce_dims = (-2, -1)
     tile_mean = tile_f.mean(dim=reduce_dims, keepdim=True)
     reference_mean = reference_f.mean(dim=reduce_dims, keepdim=True)
-    tile_std = tile_f.std(dim=reduce_dims, keepdim=True).clamp_min(1e-4)
-    reference_std = reference_f.std(dim=reduce_dims, keepdim=True).clamp_min(1e-4)
-    std_ratio = (reference_std / tile_std).clamp(0.65, 1.55)
-    matched = (tile_f - tile_mean) * std_ratio + reference_mean
+    matched = tile_f + (reference_mean - tile_mean)
     return torch.lerp(tile_f, matched, strength).to(dtype=tile.dtype)
 
 
@@ -2229,7 +2226,7 @@ def _decode_samples(
         )
         _pid_console(f"context min: {min_size}x{min_size}px input | output commit keeps the requested tile", indent=2)
         if reference_match_state is not None:
-            _pid_console("reference anchor: per-tile moment stabilization", indent=2)
+            _pid_console("reference anchor: conservative per-tile mean stabilization", indent=2)
         _pid_console(f"grid offset: {grid_offset_latent * compression * handle.pid_scale}px | global state: cpu", indent=2)
         weight_cache_cpu = {}
 
@@ -2425,7 +2422,7 @@ def _decode_samples(
                                 job.out_y : job.out_y + tile_h,
                                 job.out_x : job.out_x + tile_w,
                             ].to(device=tile_x0_cropped.device, dtype=tile_x0_cropped.dtype)
-                            tile_x0_cropped = _match_tile_moments_to_reference(tile_x0_cropped, reference_tile)
+                            tile_x0_cropped = _match_tile_mean_to_reference(tile_x0_cropped, reference_tile)
 
                         weight_key = (
                             tile_h,
