@@ -596,7 +596,8 @@ class PiDRuntimeTests(unittest.TestCase):
 
         self.assertEqual(patched_decode.call_count, 2)
         refine_kwargs = patched_decode.call_args_list[1].kwargs
-        self.assertEqual(refine_kwargs["tile_grid_offset"], 224)
+        self.assertEqual(refine_kwargs["tile_grid_offset"], 192)
+        self.assertEqual(refine_kwargs["tile_overlap"], 128)
         self.assertEqual(refine_kwargs["seed"], 3)
         self.assertAlmostEqual(refine_kwargs["source_denoise_strength"], 0.25)
         self.assertAlmostEqual(refine_kwargs["source_detail_noise_boost"], 0.0)

@@ -112,7 +112,7 @@ MIN_TILED_INFERENCE_INPUT_SIZE = {
     "zimage": 512,
     "zimage-turbo": 512,
 }
-TILED_REFERENCE_MEAN_MATCH_STRENGTH = 0.25
+TILED_REFERENCE_MEAN_MATCH_STRENGTH = 0.10
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
@@ -2877,10 +2877,15 @@ def decode_latent_tiled(
     if tile_batch_size <= 0:
         raise ValueError("tile_batch_size must be greater than zero.")
     requested_tile_size = int(tile_size)
+    requested_tile_overlap = int(tile_overlap)
     min_output_tile = int(MIN_TILED_DECODE_SIZE.get(handle.backbone, tile_size))
     if tile_size < min_output_tile:
         tile_size = min_output_tile
         tile_overlap = min(int(tile_overlap), max(0, tile_size - output_unit))
+    min_blend_overlap = max(output_unit, ((max(output_unit, int(tile_size) // 4) // output_unit) * output_unit))
+    min_blend_overlap = min(min_blend_overlap, max(0, int(tile_size) - output_unit))
+    if int(tile_overlap) > 0 and int(tile_overlap) < min_blend_overlap:
+        tile_overlap = min_blend_overlap
 
     latent_tensor, geom = _prepare_decode_latent(latent, handle)
     latent_dict = {"samples": latent_tensor, LATENT_IMAGE_GEOMETRY_KEY: geom}
@@ -2908,6 +2913,11 @@ def decode_latent_tiled(
     if tile_size != requested_tile_size:
         _pid_console(
             f"tile auto-adjust: requested {requested_tile_size}px -> {tile_size}px for stable {handle.backbone} context",
+            indent=1,
+        )
+    if tile_overlap != requested_tile_overlap:
+        _pid_console(
+            f"overlap auto-adjust: requested {requested_tile_overlap}px -> {tile_overlap}px for smoother tile blending",
             indent=1,
         )
     _pid_console(f"tile: {int(tile_size)}px | overlap: {int(tile_overlap)}px | tile_batch_size: {int(tile_batch_size)}", indent=1)
