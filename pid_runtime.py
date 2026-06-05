@@ -113,8 +113,6 @@ MIN_TILED_INFERENCE_INPUT_SIZE = {
     "zimage-turbo": 512,
 }
 TILED_REFERENCE_MOMENT_MATCH_STRENGTH = 0.55
-TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_STRENGTH = 0.60
-TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_SIZE = 129
 LATENT_IMAGE_GEOMETRY_KEY = "pid_image_geometry"
 LATENT_REFERENCE_IMAGE_KEY = "pid_reference_image"
 
@@ -2032,50 +2030,6 @@ def _match_tile_moments_to_reference(
     return torch.lerp(tile_f, matched, strength).to(dtype=tile.dtype)
 
 
-def _anchor_low_frequency_to_reference(
-    prediction: torch.Tensor,
-    reference: torch.Tensor,
-    strength: float = TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_STRENGTH,
-    max_size: int = TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_SIZE,
-) -> torch.Tensor:
-    if prediction.shape != reference.shape or prediction.ndim != 4:
-        return prediction
-    strength = max(0.0, min(1.0, float(strength)))
-    if strength <= 0.0:
-        return prediction
-
-    pred_f = prediction.float()
-    ref_f = reference.to(device=prediction.device, dtype=torch.float32)
-    height = int(pred_f.shape[-2])
-    width = int(pred_f.shape[-1])
-    if height <= 0 or width <= 0:
-        return prediction
-
-    kernel_size = int(max_size)
-    kernel_size = max(3, kernel_size + (1 - kernel_size % 2))
-    kernel_size = min(kernel_size, max(3, min(height, width) | 1))
-    if kernel_size <= 3:
-        return torch.lerp(pred_f, ref_f, strength).to(dtype=prediction.dtype)
-
-    sigma = max(1.0, float(kernel_size) / 6.0)
-    coords = torch.arange(kernel_size, device=pred_f.device, dtype=torch.float32) - (kernel_size - 1) * 0.5
-    kernel = torch.exp(-(coords * coords) / (2.0 * sigma * sigma))
-    kernel = kernel / kernel.sum().clamp_min(1e-6)
-    channels = int(pred_f.shape[1])
-    kernel_y = kernel.view(1, 1, kernel_size, 1).repeat(channels, 1, 1, 1)
-    kernel_x = kernel.view(1, 1, 1, kernel_size).repeat(channels, 1, 1, 1)
-
-    def _blur(value: torch.Tensor) -> torch.Tensor:
-        pad = kernel_size // 2
-        value = F.pad(value, (0, 0, pad, pad), mode="replicate")
-        value = F.conv2d(value, kernel_y, groups=channels)
-        value = F.pad(value, (pad, pad, 0, 0), mode="replicate")
-        return F.conv2d(value, kernel_x, groups=channels)
-
-    correction = _blur(ref_f) - _blur(pred_f)
-    return (pred_f + correction * strength).to(dtype=prediction.dtype)
-
-
 def _decode_samples(
     handle: PiDHandle,
     latent_tensor: torch.Tensor,
@@ -2275,10 +2229,7 @@ def _decode_samples(
         )
         _pid_console(f"context min: {min_size}x{min_size}px input | output commit keeps the requested tile", indent=2)
         if reference_match_state is not None:
-            _pid_console(
-                f"reference anchor: moments + gaussian low-frequency stabilization ({TILED_REFERENCE_LOW_FREQUENCY_ANCHOR_SIZE}px)",
-                indent=2,
-            )
+            _pid_console("reference anchor: per-tile moment stabilization", indent=2)
         _pid_console(f"grid offset: {grid_offset_latent * compression * handle.pid_scale}px | global state: cpu", indent=2)
         weight_cache_cpu = {}
 
@@ -2507,11 +2458,7 @@ def _decode_samples(
                 tile_progress.update(advance=len(job_window_batch))
 
         tile_progress.update(advance=0, force=True)
-        x0_global = x0_global_accum / weight_sum.clamp_min(1e-6)
-        if reference_match_state is not None:
-            reference_global = reference_match_state.to(device=x0_global.device, dtype=x0_global.dtype)
-            x0_global = _anchor_low_frequency_to_reference(x0_global, reference_global)
-        return x0_global
+        return x0_global_accum / weight_sum.clamp_min(1e-6)
 
     with torch.inference_mode():
         if source_state is not None and source_denoise_strength <= 1e-6:

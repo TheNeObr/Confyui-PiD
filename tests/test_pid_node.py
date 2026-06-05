@@ -1022,17 +1022,6 @@ class PiDRuntimeTests(unittest.TestCase):
         self.assertLess(matched.mean().item(), tile.mean().item())
         self.assertGreater(matched.mean().item(), reference.mean().item())
 
-    def test_anchor_low_frequency_to_reference_reduces_tiled_luma_drift(self):
-        prediction = torch.zeros((1, 3, 32, 32), dtype=torch.float32)
-        prediction[:, :, :, 16:] = 0.8
-        reference = torch.zeros_like(prediction)
-
-        anchored = pid_runtime._anchor_low_frequency_to_reference(prediction, reference, strength=0.5, max_size=8)
-
-        self.assertEqual(tuple(anchored.shape), tuple(prediction.shape))
-        self.assertEqual(anchored.dtype, prediction.dtype)
-        self.assertLess(anchored[:, :, :, 16:].mean().item(), prediction[:, :, :, 16:].mean().item())
-
     def test_small_tiled_decode_expands_context_window(self):
         base_job = pid_runtime._TileDecodeJob(start_y=32, start_x=32, end_y=64, end_x=64, out_y=1024, out_x=1024)
         expanded = pid_runtime._expand_tile_job(
