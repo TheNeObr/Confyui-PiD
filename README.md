@@ -1,4 +1,7 @@
-# ComfyUI PiD
+# ComfyUI PiD (Version V2)
+
+> [!IMPORTANT]
+> **This is the V2 branch** of the ComfyUI PiD custom node. It features mathematically perfect variable-overlap tile blending, resolution widget corrections, speed optimizations, and unified sampling logic.
 
 Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, without relying on `PiD Conditioning` or the core `KSampler`.
 
@@ -122,9 +125,7 @@ When working with huge resolutions (e.g., upscaling/restoring 5K to 8K images, w
 
 ## Example
 
-- Example workflow: [`workflow_pid_flux2_2kto4k_tiled.json`](./workflow_pid_flux2_2kto4k_tiled.json)
-- Additional workflow example: [`FLUX2_ERNIE-PID.json`](./FLUX2_ERNIE-PID.json)
-- Additional tiled workflow example: [`PID TILED WORFLOW.json`](./PID%20TILED%20WORFLOW.json)
+- V2 Tiled Workflow: [`PID TILED WORFLOW V2.json`](./PID%20TILED%20WORFLOW%20V2.json)
 - Example output image:
 
 ![PiD example output](./pid_512-2048_flux1_upscale_example.png)
