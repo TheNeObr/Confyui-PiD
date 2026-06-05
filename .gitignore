@@ -10,3 +10,4 @@ upstream-pid/**/__pycache__/
 
 .venv/
 venv/
+tests/

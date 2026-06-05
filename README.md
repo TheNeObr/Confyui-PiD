@@ -137,7 +137,7 @@ When working with huge resolutions (e.g., upscaling/restoring 5K to 8K images, w
 - V2 Tiled Workflow: [`PID TILED WORFLOW V2.json`](./PID%20TILED%20WORFLOW%20V2.json)
 - Example output image:
 
-![PiD example output](./pid_512-2048_flux1_upscale_example.png)
+![PiD example output](./pid_512-2048_flux1_upscale_examplev2.png)
 
 - Example comparison image showing input and model result:
 
@@ -227,18 +227,3 @@ ComfyUI/custom_nodes/ComfyUI-PiD/upstream-pid/checkpoints/
 - For `flux2` and the `flux2-klein` aliases, the encode path is especially strict because the VAE uses an effective `16x` spatial compression and an internal `2x2` patchification step, so dimensions that drift away from the safe multiples are more likely to fail or produce unstable colors.
 - The `nvidia/PiD` model has its own NVIDIA usage terms. Check the model card license before distributing or using it in production.
 
-## Local Validation
-
-The unit tests in this repository validate:
-
-- ComfyUI node contracts;
-- `LATENT` to `IMAGE` conversion;
-- channel validation per backbone;
-- image encoding and prompt cache behavior;
-- correct runtime delegation with mocks.
-
-Run:
-
-```bash
-python -m unittest discover -s tests -v
-```
