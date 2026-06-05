@@ -5,6 +5,15 @@
 
 Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, without relying on `PiD Conditioning` or the core `KSampler`.
 
+## Key Improvements in V2
+
+1.  **Seamless Spatial Tile Blending**: Fully resolves vertical/horizontal grid lines and seams in tiled outputs. Uses a mathematically correct variable-overlap cosine blending mask (`_tile_weight_mask_var`) that handles uneven grids and asymmetric overlaps perfectly.
+2.  **Flux2 Quality Fix**: Increases the minimum inference context size for the `flux2` backbone to 512px, preventing color shifts, contrast collapse, and flat textures at tile boundaries.
+3.  **UI Resolution Widget Fix**: Corrects the inverted resolution display below the preview from `height x width` to `width x height`.
+4.  **Timescale Scope Bug Fix**: Fixes a `NameError` crash (`cannot access free variable 'timescale'`) that occurred when running single-step SDE/velocity models.
+5.  **Removed Experimental Frequency Anchoring**: Removed older Fourier/frequency anchoring methods which caused vertical lines, grid patterns, and artifacting.
+6.  **Optimized Tiled Batch Execution**: Fully integrates parallel processing of tiles via `tile_batch_size` to scale performance with available VRAM.
+
 ## What This Package Does
 
 - Loads the official PiD checkpoints for `flux`, `sd3`, `flux2`, `flux2-klein-4b`, `flux2-klein-9b`, `sdxl`, `qwenimage`, `qwenimage-2512`, `zimage`, and `zimage-turbo`.
@@ -37,18 +46,18 @@ Custom node for using `nvidia/PiD` in ComfyUI with the native PiD workflow, with
   - Output: `LATENT`.
 
 - `PiD Decode Latent`
-  - Inputs: `PID_MODEL`, `LATENT`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
-  - Optional input: `PID_PROMPT`.
+  - Inputs: `pid_model`, `latent`, `prompt`, `negative_prompt`, `cfg_scale`, `pid_inference_steps`, `seed`, `degrade_sigma`, `lq_conditioning_boost`, `source_denoise_strength`, `source_detail_noise_boost`, `sde_noise_strength`, `color_match`.
+  - Optional inputs: `pid_prompt`, `clip`, `image_ref`.
   - Output: `IMAGE`.
 
 - `PiD Decode Latent Tiled`
-  - Inputs: `PID_MODEL`, `LATENT`, `tile_size`, `tile_overlap`, `tile_batch_size`, `seam_refine`, `seam_refine_strength`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`.
-  - Optional input: `PID_PROMPT`.
+  - Inputs: `pid_model`, `latent`, `tile_size`, `tile_overlap`, `tile_batch_size`, `seam_refine`, `seam_refine_strength`, `prompt`, `negative_prompt`, `cfg_scale`, `pid_inference_steps`, `seed`, `degrade_sigma`, `lq_conditioning_boost`, `source_denoise_strength`, `source_detail_noise_boost`, `sde_noise_strength`, `tiled_sde_noise_boost`, `color_match`.
+  - Optional inputs: `pid_prompt`, `clip`, `image_ref`.
   - Output: `IMAGE`.
 
 - `PiD KSampler`
-  - Inputs: `PID_MODEL`, `LATENT`, `prompt`, `pid_inference_steps`, `seed`, `degrade_sigma`, `keep_model_loaded_on_gpu`, `use_tiled`, `tile_size`, `tile_overlap`, `tile_batch_size`, `seam_refine`, `seam_refine_strength`.
-  - Optional input: `PID_PROMPT`.
+  - Inputs: `pid_model`, `latent`, `prompt`, `negative_prompt`, `cfg_scale`, `pid_inference_steps`, `seed`, `degrade_sigma`, `lq_conditioning_boost`, `source_denoise_strength`, `source_detail_noise_boost`, `keep_model_loaded_on_gpu`, `use_tiled`, `tile_size`, `tile_overlap`, `tile_batch_size`, `seam_refine`, `seam_refine_strength`, `sde_noise_strength`, `tiled_sde_noise_boost`, `color_match`.
+  - Optional inputs: `pid_prompt`, `clip`, `image_ref`.
   - Shows step progress, `it/s`, and ETA in the CLI during generation.
   - In tiled mode, shows an incremental low-resolution preview during tile restoration and replaces it with the final blended composition when done.
   - Output: `IMAGE`.
